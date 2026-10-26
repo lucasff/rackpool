@@ -1532,7 +1532,7 @@ func (c *Coordinator) Status() proto.StatusResponse {
 	for _, s := range c.cat.LiveSegments() {
 		si := c.info(s.ID)
 		st := proto.SegmentStatus{
-			ID: s.ID, Class: class(s), Refs: s.Refs,
+			ID: s.ID, Class: class(s), Refs: s.Refs, Size: s.CipherSize,
 			Target:  min(c.base(s)+c.extra(s, now), c.cfg.Params.MaxN),
 			Durable: len(h[s.ID]), HeatPerMin: c.heat(si, now) * 60, Repairing: si.pending != nil,
 		}

@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,9 +19,12 @@ import (
 
 	"mediapool/internal/auth"
 	"mediapool/internal/bridge"
+	"mediapool/internal/client"
 	"mediapool/internal/envflag"
 	"mediapool/internal/limits"
 	"mediapool/internal/node"
+	"mediapool/internal/rc"
+	"mediapool/internal/vfs"
 )
 
 func main() {
@@ -47,6 +51,11 @@ func main() {
 	flag.IntVar(&cfg.MaxTransfers, "max-transfers", 16, "concurrent shard transfers")
 	flag.BoolVar(&cfg.Drain, "drain", false, "move all shards to other nodes, then hold nothing (to leave the pool or free the disk)")
 	mirror := flag.String("bridge-mirror", "", "act as a bridge, serving torrent sources from this directory (<dir>/<infohash>/<file>)")
+	rcAddr := flag.String("rc-addr", "", "serve the rc API and web UI here, e.g. 127.0.0.1:5572 (off by default)")
+	rcUser := flag.String("rc-user", "", "rc basic-auth user (required unless -rc-addr is loopback)")
+	rcPass := flag.String("rc-pass", "", "rc basic-auth password")
+	rcMember := flag.String("rc-member", "", "also show the library in the web UI, as this member (needs -rc-member-key and MEDIAPOOL_SECRET)")
+	rcMemberKey := flag.String("rc-member-key", "", "that member's private key file")
 	pubkey := flag.Bool("print-pubkey", false, "print this node's public key (creating the key if needed) and exit")
 	if err := envflag.Parse(flag.CommandLine, os.Args[1:]); err != nil {
 		log.Fatal(err)
@@ -94,6 +103,11 @@ func main() {
 	defer n.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *rcAddr != "" {
+		if err := startRC(ctx, n, *rcAddr, *rcUser, *rcPass, *rcMember, *rcMemberKey, cfg); err != nil {
+			log.Fatal(err)
+		}
+	}
 	go n.RunReachability(ctx, ro)
 	go n.Run(ctx)
 	mux := http.NewServeMux()
@@ -108,4 +122,36 @@ func main() {
 	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+}
+
+func startRC(ctx context.Context, n *node.Node, addr, user, pass, member, memberKey string, cfg node.Config) error {
+	host, _, _ := net.SplitHostPort(addr)
+	if ip := net.ParseIP(host); user == "" && host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return fmt.Errorf("-rc-addr %s is not loopback: set -rc-user/-rc-pass", addr)
+	}
+	s := &rc.Server{Node: n, User: user, Pass: pass, WebGUI: true}
+	if member != "" {
+		key, err := auth.LoadOrCreateKey(memberKey)
+		if err != nil {
+			return err
+		}
+		secret := os.Getenv("MEDIAPOOL_SECRET")
+		if secret == "" {
+			return fmt.Errorf("-rc-member needs MEDIAPOOL_SECRET")
+		}
+		c, err := client.New(cfg.CoordURL, []byte(secret), member, key, cfg.Pool, "")
+		if err != nil {
+			return err
+		}
+		s.FS = vfs.New(c)
+	}
+	srv := &http.Server{Addr: addr, Handler: s.Handler(), ReadHeaderTimeout: 30 * time.Second}
+	go func() { <-ctx.Done(); _ = srv.Close() }()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("rc: %v", err)
+		}
+	}()
+	log.Printf("rc and web UI on http://%s", addr)
+	return nil
 }

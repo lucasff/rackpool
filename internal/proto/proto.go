@@ -237,6 +237,7 @@ type SegmentStatus struct {
 	ID         string  `json:"id"`
 	Class      string  `json:"class"`
 	Refs       int     `json:"refs"`
+	Size       int     `json:"size"` // ciphertext bytes, ≈ the unique content it holds
 	Target     int     `json:"target"`
 	Durable    int     `json:"durable"`
 	Online     int     `json:"online"`

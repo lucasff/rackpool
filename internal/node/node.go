@@ -92,6 +92,8 @@ type Node struct {
 	addr     string
 	reach    string
 	quota    int64
+	upBps    int64 // current caps; the buckets enforce them
+	downBps  int64
 	used     int64 // bytes of shards on disk, kept current on write/delete
 }
 
@@ -134,7 +136,7 @@ func New(cfg Config) (*Node, error) {
 	n := &Node{
 		cfg: cfg, id: auth.NewIdentity(cfg.Key), coord: coord, cat: cat, coordURL: cfg.CoordURL,
 		up: up, down: down, slots: make(chan struct{}, cfg.MaxTransfers),
-		drain: cfg.Drain, quota: cfg.Quota, addr: cfg.Addr,
+		drain: cfg.Drain, quota: cfg.Quota, addr: cfg.Addr, upBps: cfg.UploadBps, downBps: cfg.DownloadBps,
 	}
 	if n.used, err = n.diskUsage(); err != nil {
 		return nil, err
@@ -146,7 +148,7 @@ func New(cfg Config) (*Node, error) {
 // below current usage makes the pool move shards off this node.
 func (n *Node) SetLimits(quota, uploadBps, downloadBps int64, drain bool) {
 	n.mu.Lock()
-	n.quota, n.drain = quota, drain
+	n.quota, n.drain, n.upBps, n.downBps = quota, drain, uploadBps, downloadBps
 	n.mu.Unlock()
 	n.up.SetRate(uploadBps)
 	n.down.SetRate(downloadBps)
@@ -176,7 +178,7 @@ func (n *Node) info() proto.NodeInfo {
 // Capacity reports what this node offers the pool right now.
 func (n *Node) Capacity() proto.Capacity {
 	n.mu.Lock()
-	quota, used, drain := n.quota, n.used, n.drain
+	quota, used, drain, up, down := n.quota, n.used, n.drain, n.upBps, n.downBps
 	n.mu.Unlock()
 	avail := int64(-1)
 	if free, err := diskfree.Free(n.cfg.DataDir); err == nil {
@@ -189,7 +191,7 @@ func (n *Node) Capacity() proto.Capacity {
 	}
 	return proto.Capacity{
 		Quota: quota, Used: used, Free: avail, Drain: drain,
-		UploadBps: n.cfg.UploadBps, DownloadBps: n.cfg.DownloadBps,
+		UploadBps: up, DownloadBps: down,
 	}
 }
 

@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mediapool</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #fff; --text: #1d2330; --muted: #667085; --line: #e3e6ec;
+  --accent: #2f6fde; --accent-text: #fff; --ok: #1a7f4b; --warn: #b26a00; --bad: #c0362c; --chip: #eef2f8;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --panel: #1a1f27; --text: #e5e8ee; --muted: #9aa3b2; --line: #2a313c;
+    --accent: #5b8ff0; --accent-text: #0d1117; --ok: #4cc38a; --warn: #f0b04a; --bad: #f06a5e; --chip: #232a35;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 16px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button { background: none; border: 0; color: var(--muted); padding: 6px 10px; border-radius: 6px; cursor: pointer; font: inherit; }
+nav button.on { background: var(--chip); color: var(--text); font-weight: 600; }
+#who { margin-left: auto; color: var(--muted); font-size: 13px; }
+main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+section { display: none; } section.on { display: block; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+.card h2 { font-size: 14px; margin: 0 0 10px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.tile { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+.tile b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+.tile span { color: var(--muted); font-size: 12px; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.name { white-space: normal; word-break: break-all; }
+.scroll { overflow-x: auto; }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+.crumbs { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+.crumbs a { cursor: pointer; }
+.btn { background: var(--accent); color: var(--accent-text); border: 0; border-radius: 6px; padding: 6px 12px; cursor: pointer; font: inherit; }
+.btn.ghost { background: var(--chip); color: var(--text); }
+.btn.danger { background: none; color: var(--bad); padding: 2px 6px; }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 99px; background: var(--chip); font-size: 12px; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+.muted { color: var(--muted); }
+form.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; align-items: end; }
+label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+input[type=text] { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; }
+.bar { height: 6px; background: var(--chip); border-radius: 3px; overflow: hidden; min-width: 80px; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+#toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 8px; display: none; max-width: 90vw; }
+video { width: 100%; max-height: 60vh; background: #000; border-radius: 8px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>mediapool</h1>
+  <nav id="tabs"></nav>
+  <span id="who"></span>
+</header>
+<main>
+  <section id="library">
+    <div class="card">
+      <div class="crumbs" id="crumbs"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <label class="btn ghost" style="display:inline-block;color:var(--text)">Upload files<input id="upload" type="file" multiple hidden></label>
+        <button class="btn ghost" id="refresh">Refresh</button>
+      </div>
+      <div class="scroll"><table><thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Added by</th><th></th></tr></thead><tbody id="files"></tbody></table></div>
+      <div id="player"></div>
+    </div>
+  </section>
+  <section id="pool">
+    <div class="tiles" id="poolTiles"></div>
+    <div class="card"><h2>Nodes</h2><div class="scroll"><table><thead><tr><th>Node</th><th>Owner</th><th>Status</th><th>Reach</th><th>Shards</th><th>Used</th><th>Free</th><th>Upload</th><th>Reliability</th></tr></thead><tbody id="nodes"></tbody></table></div></div>
+    <div class="card"><h2>Segments</h2><p class="muted" id="segSummary"></p></div>
+  </section>
+  <section id="node">
+    <div class="tiles" id="nodeTiles"></div>
+    <div class="card">
+      <h2>Limits</h2>
+      <p class="muted">Changes apply immediately and last until the node restarts. Set MP_QUOTA, MP_UPLOAD_LIMIT etc. to make them permanent.</p>
+      <form class="grid" id="limits">
+        <label>Storage quota <input type="text" name="quota" placeholder="e.g. 2T, 0 = all free space"></label>
+        <label>Upload limit <input type="text" name="upload_limit" placeholder="e.g. 50M (Mbit/s), 0 = unlimited"></label>
+        <label>Download limit <input type="text" name="download_limit" placeholder="e.g. 200M"></label>
+        <label><span><input type="checkbox" name="drain"> Drain (move all shards away)</span></label>
+        <button class="btn" type="submit">Apply</button>
+      </form>
+    </div>
+    <div class="card"><h2>Reachability</h2><div id="reach"></div></div>
+  </section>
+  <section id="transfers">
+    <div class="tiles" id="statTiles"></div>
+    <div class="card"><h2>Active</h2><div class="scroll"><table><thead><tr><th>File</th><th>Progress</th><th>Speed</th></tr></thead><tbody id="active"></tbody></table></div></div>
+    <div class="card"><h2>Jobs</h2><div class="scroll"><table><thead><tr><th>ID</th><th>Call</th><th>Status</th><th>Duration</th></tr></thead><tbody id="jobs"></tbody></table></div></div>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const bytes = n => { if (n == null || n < 0) return "?"; const u = ["B","KB","MB","GB","TB","PB"]; let i = 0; while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; } return (i ? n.toFixed(1) : n) + " " + u[i]; };
+const mbit = bps => bps ? (bps * 8 / 1e6).toFixed(0) + " Mbit/s" : "unlimited";
+const when = t => t && !t.startsWith("0001") ? new Date(t).toLocaleString() : "";
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(toast.t); toast.t = setTimeout(() => t.style.display = "none", 4000); }
+
+async function rc(path, params = {}) {
+  const r = await fetch("/" + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params) });
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+let caps = {}, dir = "/", tab = "";
+const tabs = [["library", "Library", () => caps.library], ["pool", "Pool", () => caps.library], ["node", "This node", () => caps.node], ["transfers", "Transfers", () => true]];
+
+function show(name) {
+  tab = name;
+  if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
+  for (const b of $("tabs").children) b.classList.toggle("on", b.dataset.tab === name);
+  for (const s of document.querySelectorAll("section")) s.classList.toggle("on", s.id === name);
+  refresh();
+}
+
+async function refresh() {
+  try {
+    if (tab === "library") await loadLibrary();
+    if (tab === "pool") await loadPool();
+    if (tab === "node") await loadNode();
+    if (tab === "transfers") await loadTransfers();
+  } catch (e) { toast(e.message); }
+}
+
+async function loadLibrary() {
+  const { list } = await rc("operations/list", { remote: dir });
+  const parts = dir.split("/").filter(Boolean);
+  let acc = "", crumbs = `<a data-dir="/">pool</a>`;
+  for (const p of parts) { acc += "/" + p; crumbs += ` / <a data-dir="${esc(acc)}">${esc(p)}</a>`; }
+  $("crumbs").innerHTML = crumbs;
+  const rows = list.map(e => e.IsDir
+    ? `<tr><td class="name">📁 <a data-dir="${esc(e.Path)}">${esc(e.Name)}</a></td><td>${bytes(e.Size)}</td><td>${when(e.ModTime)}</td><td></td><td></td></tr>`
+    : `<tr><td class="name">${/\.(mkv|mp4|webm|m4v|mov)$/i.test(e.Name) ? `<a data-play="${esc(e.Path)}">▶</a> ` : ""}<a href="/files${encodeURI(e.Path)}" target="_blank" rel="noopener">${esc(e.Name)}</a></td>
+       <td>${bytes(e.Size)}</td><td>${when(e.ModTime)}</td><td>${esc(e.Author)}</td>
+       <td>${e.Author === caps.member ? `<button class="btn danger" data-del="${esc(e.Path)}">Delete</button>` : ""}</td></tr>`);
+  $("files").innerHTML = rows.join("") || `<tr><td colspan="5" class="muted">Empty. Upload files or run <code>mp copy</code>.</td></tr>`;
+}
+
+$("crumbs").onclick = $("files").onclick = async ev => {
+  const a = ev.target.closest("[data-dir],[data-del],[data-play]");
+  if (!a) return;
+  if (a.dataset.dir) { dir = a.dataset.dir; $("player").innerHTML = ""; return loadLibrary(); }
+  if (a.dataset.play) { $("player").innerHTML = `<video controls autoplay src="/files${encodeURI(a.dataset.play)}"></video>`; return; }
+  if (a.dataset.del && confirm("Delete " + a.dataset.del + " from the pool?")) {
+    try { await rc("operations/deletefile", { remote: a.dataset.del }); toast("Deleted"); } catch (e) { toast(e.message); }
+    const parent = a.dataset.del.replace(/\/[^/]*$/, "") || "/";
+    try { await loadLibrary(); } catch { dir = parent === dir ? "/" : dir; loadLibrary().catch(() => {}); }
+  }
+};
+$("refresh").onclick = refresh;
+$("upload").onchange = async ev => {
+  const fd = new FormData();
+  for (const f of ev.target.files) fd.append("file", f, f.name);
+  toast("Uploading " + ev.target.files.length + " file(s)…");
+  const r = await fetch("/operations/uploadfile?remote=" + encodeURIComponent(dir), { method: "POST", body: fd });
+  const j = await r.json().catch(() => ({}));
+  toast(r.ok ? "Uploaded " + (j.uploaded || []).length + " file(s)" : (j.error || r.statusText));
+  ev.target.value = "";
+  loadLibrary();
+};
+
+function tiles(el, items) { $(el).innerHTML = items.map(([v, l, cls]) => `<div class="tile"><b class="${cls || ""}">${esc(v)}</b><span>${esc(l)}</span></div>`).join(""); }
+
+async function loadPool() {
+  const [a, st] = await Promise.all([rc("operations/about"), rc("pool/status")]);
+  tiles("poolTiles", [
+    [a.files, "files in the pool"], [bytes(a.bytes), "in all libraries"], [bytes(a.unique_bytes), "unique after dedup"],
+    [a.dedup ? a.dedup.toFixed(1) + "×" : "–", "dedup ratio"], [`${a.nodes_online}/${a.nodes}`, "nodes online"],
+    [bytes(a.used_bytes), "stored on nodes"], [a.overhead ? a.overhead.toFixed(2) + "×" : "–", "redundancy (stored ÷ unique)"],
+    [a.nodes_relayed, "nodes via relay", a.nodes_relayed ? "warn" : ""],
+  ]);
+  $("nodes").innerHTML = (st.nodes || []).map(n => {
+    const used = n.capacity.used, free = n.capacity.free, pct = free >= 0 && used + free > 0 ? 100 * used / (used + free) : 0;
+    const rel = 1 - n.fail_prob;
+    return `<tr><td>${esc(n.id)}${n.bridge ? ' <span class="chip">bridge</span>' : ""}</td><td>${esc(n.owner)}</td>
+      <td class="${n.online ? "ok" : "bad"}">${n.online ? "online" : "offline"}${n.capacity.drain ? ' <span class="chip">draining</span>' : ""}</td>
+      <td><span class="chip ${n.reach === "relay" ? "warn" : ""}">${esc(n.reach || "–")}</span></td>
+      <td>${n.shards}</td><td>${bytes(used)}<div class="bar"><i style="width:${pct}%"></i></div></td><td>${bytes(free)}</td>
+      <td>${mbit(n.capacity.upload_bps)}</td><td class="${rel > 0.95 ? "ok" : rel > 0.8 ? "warn" : "bad"}">${(rel * 100).toFixed(1)}%${n.strikes ? ` · ${n.strikes} strikes` : ""}</td></tr>`;
+  }).join("");
+  const segs = st.segments || [], cls = {};
+  for (const s of segs) cls[s.class] = (cls[s.class] || 0) + 1;
+  const repairing = segs.filter(s => s.repairing).length, weak = segs.filter(s => s.online < st.params.k + 2).length;
+  $("segSummary").innerHTML = `${segs.length} segments · ` + Object.entries(cls).map(([k, v]) => `${v} ${esc(k)}`).join(" · ")
+    + ` · <span class="${repairing ? "warn" : ""}">${repairing} repairing</span> · <span class="${weak ? "bad" : ""}">${weak} with fewer than k+2 shards online</span>`
+    + (st.write_blocked ? `<br><span class="bad">Writes blocked: ${esc(st.write_blocked)}</span>` : "");
+}
+
+async function loadNode() {
+  const n = await rc("node/status"), c = n.capacity, r = n.reachability || {};
+  tiles("nodeTiles", [
+    [n.id, n.bridge ? "bridge node" : "storage node"], [bytes(c.used), "stored"], [bytes(c.free), "still offered"],
+    [mbit(c.upload_bps), "upload limit"], [n.reach || "unchecked", "reachability", n.reach === "relay" ? "warn" : "ok"],
+  ]);
+  const f = $("limits");
+  if (document.activeElement?.form !== f) {
+    f.quota.value = c.quota ? bytes(c.quota).replace(" ", "").replace("B", "") : "0";
+    f.upload_limit.value = c.upload_bps ? (c.upload_bps * 8 / 1e6) + "M" : "0";
+    f.download_limit.value = c.download_bps ? (c.download_bps * 8 / 1e6) + "M" : "0";
+    f.drain.checked = c.drain;
+  }
+  $("reach").innerHTML = `<p>Advertised address: <code>${esc(n.addr)}</code> <span class="chip">${esc(n.reach || "unchecked")}</span>${r.relay_up ? ' <span class="chip ok">tunnel up</span>' : ""}</p>`
+    + (r.public_ip ? `<p>Public IP (STUN): ${esc(r.public_ip)}${r.router_ip ? ` · router WAN: ${esc(r.router_ip)}` : ""}${r.cgnat ? ' <span class="chip bad">carrier-grade NAT</span>' : ""}</p>` : "")
+    + (r.port_map ? `<p>Port mapping: ${esc(r.port_map)}</p>` : "")
+    + (r.suggestion ? `<p class="warn">${esc(r.suggestion)}</p>` : "")
+    + (r.checked_at ? `<p class="muted">Checked ${when(r.checked_at)}</p>` : "");
+}
+
+$("limits").onsubmit = async ev => {
+  ev.preventDefault();
+  const f = ev.target;
+  try {
+    await rc("node/limits/set", { quota: f.quota.value.trim(), upload_limit: f.upload_limit.value.trim(), download_limit: f.download_limit.value.trim(), drain: f.drain.checked });
+    toast("Limits applied");
+    f.querySelector("button").focus();
+    loadNode();
+  } catch (e) { toast(e.message); }
+};
+
+async function loadTransfers() {
+  const s = await rc("core/stats");
+  tiles("statTiles", [[bytes(s.bytes), "transferred"], [bytes(s.speed) + "/s", "average speed"], [s.transfers, "completed"], [s.errors, "errors", s.errors ? "bad" : ""]]);
+  $("active").innerHTML = s.transferring.map(t => `<tr><td class="name">${esc(t.name)}</td><td><div class="bar"><i style="width:${t.percentage}%"></i></div> ${t.size > 0 ? t.percentage + "%" : bytes(t.bytes)}</td><td>${bytes(t.speed)}/s</td></tr>`).join("")
+    || `<tr><td colspan="3" class="muted">Nothing transferring.</td></tr>`;
+  const { jobids } = await rc("job/list");
+  const jobs = await Promise.all(jobids.slice(-20).reverse().map(id => rc("job/status", { jobid: id })));
+  $("jobs").innerHTML = jobs.map(j => `<tr><td>${j.id}</td><td>${esc(j.name)}</td><td class="${!j.finished ? "" : j.success ? "ok" : "bad"}">${!j.finished ? "running" : j.success ? "done" : esc(j.error)}</td><td>${j.duration.toFixed(1)} s</td></tr>`).join("")
+    || `<tr><td colspan="4" class="muted">No jobs.</td></tr>`;
+}
+
+(async () => {
+  try { caps = await rc("core/capabilities"); } catch (e) { toast(e.message); return; }
+  $("who").textContent = [caps.member && "member " + caps.member, caps.node && "node", "v" + caps.version].filter(Boolean).join(" · ");
+  for (const [id, label, avail] of tabs) {
+    if (!avail()) continue;
+    const b = document.createElement("button");
+    b.textContent = label; b.dataset.tab = id; b.onclick = () => show(id);
+    $("tabs").appendChild(b);
+  }
+  const want = location.hash.slice(1);
+  show([...$("tabs").children].some(b => b.dataset.tab === want) ? want : $("tabs").firstChild.dataset.tab);
+  setInterval(() => { if (tab !== "library") refresh(); }, 3000);
+})();
+</script>
+</body>
+</html>

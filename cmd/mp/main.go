@@ -1,236 +1,135 @@
-// mp is the member CLI: add files, list the library, read files back, serve
-// the library over HTTP for a media server, and show pool status.
+// mp is the member CLI, modelled on rclone: listing, cat, copy/move/delete,
+// serving over HTTP and WebDAV, and an rc daemon with a web UI. Paths on
+// the pool side are written pool:/path (the prefix is optional where only
+// pool paths make sense). Every flag can also be set as MP_<FLAG>, e.g.
+// MP_COORD, MP_MEMBER, MP_RC_ADDR.
 package main
 
 import (
 	"context"
 	"errors"
-	"flag"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
 	"os"
-	"path"
-	"strconv"
+	"os/signal"
 	"strings"
-	"text/tabwriter"
-	"time"
+	"syscall"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"mediapool/internal/auth"
 	"mediapool/internal/client"
-	"mediapool/internal/envflag"
-	"mediapool/internal/proto"
-	"mediapool/internal/transfer"
+	"mediapool/internal/rc"
+	"mediapool/internal/stats"
+	"mediapool/internal/vfs"
 )
 
-const usage = `usage: mp [-coord URL] <command> [args]
+var version = "dev"
 
-  add <file> <pool-path> [-torrent INFOHASH -torrent-file PATH]
-  rm <pool-path>               remove a file you added
-  ls
-  cat <pool-path>              write a file to stdout
-  serve [-listen :8080]        HTTP server with range requests (point Jellyfin/VLC here)
-  status
-
-  keygen <file>                write a new private key, print its public key
-
-The pool secret is read from $MEDIAPOOL_SECRET. -pool, -member and -key
-identify you to the pool.`
+var g struct {
+	coord, pool, member, key, catalog string
+	verbose                           bool
+	dryRun                            bool
+	progress                          bool
+}
 
 func main() {
-	coordURL := flag.String("coord", "http://127.0.0.1:7000", "coordinator URL")
-	poolPath := flag.String("pool", "pool.json", "pool membership file")
-	member := flag.String("member", os.Getenv("MEDIAPOOL_MEMBER"), "your member name in the pool file")
-	keyPath := flag.String("key", "member.key", "your private key")
-	catPath := flag.String("catalog", "", "local catalog replica (default: memory only)")
-	flag.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
-	if err := envflag.Parse(flag.CommandLine, os.Args[1:]); err != nil {
-		log.Fatal(err)
+	rc.Version = version
+	root := &cobra.Command{
+		Use:           "mp",
+		Short:         "Use a mediapool: list, read, copy, serve and control it",
+		Long:          "mp is the member CLI for a mediapool. Pool paths are written pool:/path.\nEvery flag can also be set as an environment variable MP_<FLAG> (e.g. MP_COORD, MP_MEMBER).\nThe pool secret is read from $MEDIAPOOL_SECRET.",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Version:       version,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			return bindEnv(cmd)
+		},
 	}
-	if flag.NArg() < 1 {
-		flag.Usage()
-		os.Exit(2)
+	pf := root.PersistentFlags()
+	pf.StringVar(&g.coord, "coord", "http://127.0.0.1:7000", "coordinator URL")
+	pf.StringVar(&g.pool, "pool", "pool.json", "pool membership file")
+	pf.StringVar(&g.member, "member", "", "your member name in the pool file")
+	pf.StringVar(&g.key, "key", "member.key", "your private key file")
+	pf.StringVar(&g.catalog, "catalog", "", "keep a local catalog replica here between runs (faster startup)")
+	pf.BoolVarP(&g.verbose, "verbose", "v", false, "print more")
+	pf.BoolVarP(&g.dryRun, "dry-run", "n", false, "show what would change without changing anything")
+	pf.BoolVarP(&g.progress, "progress", "P", false, "show transfer progress")
+
+	root.AddCommand(lsCommands()...)
+	root.AddCommand(catCmd(), sizeCmd(), aboutCmd(), statusCmd())
+	root.AddCommand(copyCmd(false), copyCmd(true), moveCmd(), addCmd(), deleteCmd(), deletefileCmd())
+	root.AddCommand(serveCmd(), rcdCmd(), rcCmd())
+	root.AddCommand(keygenCmd())
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "mp:", err)
+		os.Exit(1)
 	}
-	cmd, args := flag.Arg(0), flag.Args()[1:]
-	if cmd == "keygen" {
-		if len(args) != 1 {
-			log.Fatal("keygen <file>")
+}
+
+// bindEnv fills unset flags from MP_<FLAG> environment variables.
+func bindEnv(cmd *cobra.Command) error {
+	var errs []string
+	set := func(f *pflag.Flag) {
+		if f.Changed {
+			return
 		}
-		k, err := auth.LoadOrCreateKey(args[0])
-		if err != nil {
-			log.Fatal(err)
+		name := "MP_" + strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
+		if v, ok := os.LookupEnv(name); ok {
+			if err := f.Value.Set(v); err != nil {
+				errs = append(errs, fmt.Sprintf("%s=%q: %v", name, v, err))
+			}
 		}
-		fmt.Println(auth.PubHex(k))
-		return
 	}
+	cmd.Flags().VisitAll(set)
+	cmd.InheritedFlags().VisitAll(set)
+	if len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// openFS connects as the configured member.
+func openFS() (*vfs.FS, error) {
 	secret := os.Getenv("MEDIAPOOL_SECRET")
 	if secret == "" {
-		log.Fatal("MEDIAPOOL_SECRET is not set")
+		return nil, errors.New("MEDIAPOOL_SECRET is not set")
 	}
-	pool, err := auth.LoadPool(*poolPath)
+	if g.member == "" {
+		return nil, errors.New("--member (MP_MEMBER) is not set")
+	}
+	pool, err := auth.LoadPool(g.pool)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	key, err := auth.LoadOrCreateKey(*keyPath)
+	key, err := auth.LoadOrCreateKey(g.key)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	c, err := client.New(*coordURL, []byte(secret), *member, key, pool, *catPath)
+	c, err := client.New(g.coord, []byte(secret), g.member, key, pool, g.catalog)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	defer c.Close()
-	ctx := context.Background()
-
-	switch cmd {
-	case "add":
-		err = add(ctx, c, args)
-	case "rm":
-		if len(args) != 1 {
-			err = errors.New("rm <pool-path>")
-		} else {
-			err = c.Remove(ctx, args[0])
-		}
-	case "ls":
-		err = ls(ctx, c)
-	case "cat":
-		err = cat(ctx, c, args)
-	case "serve":
-		err = serve(ctx, c, args)
-	case "status":
-		err = status(ctx, *coordURL, auth.NewIdentity(key))
-	default:
-		flag.Usage()
-		os.Exit(2)
-	}
-	if err != nil {
-		log.Fatal(err)
-	}
+	return vfs.New(c), nil
 }
 
-func add(ctx context.Context, c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("add", flag.ExitOnError)
-	infohash := fs.String("torrent", "", "infohash of the torrent this file came from (enables bridge repair)")
-	tfile := fs.String("torrent-file", "", "path of this file inside the torrent (default: base name)")
-	if len(args) < 2 {
-		return errors.New("add <file> <pool-path> [flags]")
-	}
-	if err := fs.Parse(args[2:]); err != nil {
-		return err
-	}
-	var src *client.Source
-	if *infohash != "" {
-		src = &client.Source{Infohash: strings.ToLower(*infohash), File: *tfile}
-		if src.File == "" {
-			src.File = path.Base(args[0])
-		}
-	}
-	st, err := c.AddFile(ctx, args[0], args[1], src)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("added %s: %d segments, %d already in pool, %s uploaded for %s of content\n",
-		args[1], st.Segments, st.Deduped, human(st.Uploaded), human(st.PlainSize))
-	return nil
-}
+var st = stats.New()
 
-func ls(ctx context.Context, c *client.Client) error {
-	ms, err := c.List(ctx)
-	if err != nil {
-		return err
-	}
-	for _, m := range ms {
-		fmt.Printf("%10s  %-10s %s\n", human(m.Size), m.Author, m.Path)
-	}
-	return nil
-}
-
-func cat(ctx context.Context, c *client.Client, args []string) error {
-	if len(args) != 1 {
-		return errors.New("cat <pool-path>")
-	}
-	m, err := c.Stat(ctx, args[0])
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(os.Stdout, c.Open(ctx, m))
-	return err
-}
-
-func serve(ctx context.Context, c *client.Client, args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	listen := fs.String("listen", ":8080", "listen address")
-	_ = fs.Parse(args)
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/" {
-			ms, err := c.List(r.Context())
+func keygenCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "keygen <file>",
+		Short: "Create a private key (if missing) and print its public key",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			k, err := auth.LoadOrCreateKey(args[0])
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
+				return err
 			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			for _, m := range ms {
-				fmt.Fprintf(w, "<a href=\"%s\">%s</a> (%s)<br>\n", m.Path, m.Path, human(m.Size))
-			}
-			return
-		}
-		m, err := c.Stat(r.Context(), r.URL.Path)
-		if err != nil {
-			http.NotFound(w, r)
-			return
-		}
-		// ServeContent handles Range requests, so players can seek.
-		http.ServeContent(w, r, path.Base(m.Path), noModTime, c.Open(r.Context(), m))
-	})
-	log.Printf("serving pool library on %s", *listen)
-	return http.ListenAndServe(*listen, h)
-}
-
-func status(ctx context.Context, coordURL string, id *auth.Identity) error {
-	var st proto.StatusResponse
-	if err := transfer.GetJSON(ctx, http.DefaultClient, id, coordURL+"/v1/status", &st); err != nil {
-		return err
+			fmt.Println(auth.PubHex(k))
+			return nil
+		},
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "catalog head %d", st.Head.Seq)
-	if st.WriteBlocked != "" {
-		fmt.Fprintf(tw, " (WRITES BLOCKED: %s)", st.WriteBlocked)
-	}
-	fmt.Fprintf(tw, "\n\nNODE\tOWNER\tONLINE\tBRIDGE\tSHARDS\tUSED\tFREE\tUP\tDRAIN\tSTRIKES\tFAIL-P\n")
-	for _, n := range st.Nodes {
-		free, up := "?", "∞"
-		if n.Capacity.Free >= 0 {
-			free = human(n.Capacity.Free)
-		}
-		if n.Capacity.UploadBps > 0 {
-			up = fmt.Sprintf("%.0fMbit", float64(n.Capacity.UploadBps)*8/1e6)
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%v\t%v\t%d\t%s\t%s\t%s\t%v\t%d\t%.3f\n", n.ID, n.Owner, n.Online, n.Bridge, n.Shards,
-			human(n.Capacity.Used), free, up, n.Capacity.Drain, n.Strikes, n.FailProb)
-	}
-	fmt.Fprintf(tw, "\nSEGMENT\tCLASS\tREFS\tONLINE/DURABLE/TARGET\tLOSS-P\tHEAT(reads/min)\tREPAIRING\n")
-	for _, s := range st.Segments {
-		target := strconv.Itoa(s.Target)
-		if s.Target == 0 {
-			target = "auto"
-		}
-		fmt.Fprintf(tw, "%.12s\t%s\t%d\t%d/%d/%s\t%.1e\t%.1f\t%v\n", s.ID, s.Class, s.Refs, s.Online, s.Durable, target, s.LossProb, s.HeatPerMin, s.Repairing)
-	}
-	return tw.Flush()
-}
-
-var noModTime time.Time
-
-func human(n int64) string {
-	const unit = 1024
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := int64(unit), 0
-	for m := n / unit; m >= unit; m /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

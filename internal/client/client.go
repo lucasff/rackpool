@@ -295,6 +295,13 @@ func (c *Client) Stat(ctx context.Context, poolPath string) (Manifest, error) {
 	return Manifest{}, fmt.Errorf("%s: %w", p, os.ErrNotExist)
 }
 
+// Status returns the coordinator's view of the pool.
+func (c *Client) Status(ctx context.Context) (proto.StatusResponse, error) {
+	var st proto.StatusResponse
+	err := transfer.GetJSON(ctx, c.HTTP, c.key, c.CoordURL+"/v1/status", &st)
+	return st, err
+}
+
 // ReadSegment fetches, verifies, decodes and decrypts one segment.
 func (c *Client) ReadSegment(ctx context.Context, e SegmentEntry) ([]byte, error) {
 	var loc proto.LocateResponse

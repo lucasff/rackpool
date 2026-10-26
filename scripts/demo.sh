@@ -11,7 +11,7 @@ export MEDIAPOOL_SECRET="demo-pool-secret"
 pids=()
 cleanup() { kill "${pids[@]}" 2>/dev/null || true; wait 2>/dev/null || true; rm -rf "$W"; }
 trap cleanup EXIT
-mp() { bin/mp -pool "$W/pool.json" -key "$W/$1.key" -member "$1" "${@:2}"; }
+mp() { bin/mp --pool "$W/pool.json" --key "$W/$1.key" --member "$1" "${@:2}"; }
 
 # Keys and the pool file (public keys only).
 COORD_PUB=$(bin/mp keygen "$W/coord.key")
@@ -48,22 +48,29 @@ pids+=($!)
 sleep 2
 
 echo "== alice adds an episode she got from torrent abc123"
-mp alice add "$W/swarm/abc123/Show.S01E01.mkv" /tv/Show/S01E01.mkv -torrent abc123
+mp alice add "$W/swarm/abc123/Show.S01E01.mkv" /tv/Show/S01E01.mkv --torrent abc123
 echo "== bob adds the same bytes under his own name: nothing uploaded"
 mp bob add "$W/swarm/abc123/Show.S01E01.mkv" /bob/show-1x01.mkv
 echo "== bob tries to delete alice's file"
-mp bob rm /tv/Show/S01E01.mkv 2>&1 | sed 's/^.*: //' || true
-mp alice ls
+mp bob deletefile /tv/Show/S01E01.mkv 2>&1 | sed 's/^.*: //' || true
+mp alice lsl
 
 echo "== waiting for the bridge to rebuild the segment from the swarm (anchored, 6 shards)"
 sleep 7
 mp alice status | sed -n '/SEGMENT/,$p'
 
 echo "== streaming over HTTP with a range request"
-bin/mp -pool "$W/pool.json" -key "$W/alice.key" -member alice serve -listen :8080 >/dev/null 2>&1 & pids+=($!)
+bin/mp --pool "$W/pool.json" --key "$W/alice.key" --member alice serve http --addr 127.0.0.1:8080 >/dev/null 2>&1 & pids+=($!)
 sleep 1
 curl -s -r 1000000-1000015 http://127.0.0.1:8080/tv/Show/S01E01.mkv | xxd | head -1
 dd if="$W/swarm/abc123/Show.S01E01.mkv" bs=1 skip=1000000 count=16 2>/dev/null | xxd | head -1
+
+if [ "${KEEP:-}" = 1 ]; then
+  mp alice copy "$W/swarm" pool:/library >/dev/null
+  bin/mp --pool "$W/pool.json" --key "$W/alice.key" --member alice rcd --rc-addr 127.0.0.1:5572 2>>"$W/rcd.log" & pids+=($!)
+  echo "== pool left running: web UI at http://127.0.0.1:5572 (Ctrl-C to stop)"
+  wait
+fi
 
 echo "== killing 8 of 13 storage nodes"
 for i in $(seq 1 8); do kill "${pids[$i]}" 2>/dev/null; done
@@ -80,8 +87,8 @@ mp alice status | head -1
 if cmp <(mp alice cat /tv/Show/S01E01.mkv) "$W/swarm/abc123/Show.S01E01.mkv"; then echo "OK: identical after coordinator recovery"; fi
 
 echo "== both members remove the file; shards are garbage-collected"
-mp alice rm /tv/Show/S01E01.mkv
-mp bob rm /bob/show-1x01.mkv
+mp alice deletefile /tv/Show/S01E01.mkv
+mp bob deletefile /bob/show-1x01.mkv
 sleep 6
 echo "shard files left on disk: $(find "$W"/n* -path '*shards*' -type f ! -name '*.proof' | wc -l | tr -d ' ')"
 

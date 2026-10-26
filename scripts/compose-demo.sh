@@ -39,9 +39,9 @@ docker compose -f docker-compose.pool.yml ps --format 'table {{.Service}}\t{{.St
 # Nodes advertise in-network names (node1:7100), so the member CLI runs as a
 # one-off container on the same network.
 mpc() { docker run --rm --network deploy_default -u "$(id -u)" -v "$PWD/$L:/l" -e MEDIAPOOL_SECRET --entrypoint mp mediapool:latest \
-  -coord http://coord:7000 -pool /l/pool.json -key /l/host/alice.key -member alice "$@"; }
+  --coord http://coord:7000 --pool /l/pool.json --key /l/host/alice.key --member alice "$@"; }
 echo "== alice adds a movie she got from torrent abc123"
-mpc add /l/swarm/abc123/Movie.mkv /movies/Movie.mkv -torrent abc123
+mpc add /l/swarm/abc123/Movie.mkv /movies/Movie.mkv --torrent abc123
 sleep 8
 mpc status
 echo "== read back"
