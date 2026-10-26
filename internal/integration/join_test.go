@@ -122,3 +122,27 @@ func TestJoinWithInvite(t *testing.T) {
 		t.Fatal("removed member can still write")
 	}
 }
+
+// A member who just joined is served immediately, not after every node's
+// next heartbeat.
+func TestJustJoinedMemberIsServed(t *testing.T) {
+	c := newCluster(t, 12, nil)
+	data := randomFile(t, 60<<10)
+	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/x.mkv", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.cycle(2)
+	inv := c.createInvite("alice", "gina", false)
+	key := auth.Generate()
+	if err := invite.Redeem(c.ctx, http.DefaultClient, inv, "gina", key, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	// No heartbeats from here on: nodes only know gina if they catch up on demand.
+	gina, err := client.New(inv.Coord, inv.Secret, "gina", key, inv.Pool(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(c.readBack(gina, "/x.mkv"), data) {
+		t.Fatal("mismatch")
+	}
+}

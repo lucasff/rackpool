@@ -85,16 +85,17 @@ type Node struct {
 	slots    chan struct{}
 	rs       reachState
 
-	mu       sync.Mutex
-	paused   bool // test hook: simulate the node going dark
-	coordURL string
-	drain    bool
-	addr     string
-	reach    string
-	quota    int64
-	upBps    int64 // current caps; the buckets enforce them
-	downBps  int64
-	used     int64 // bytes of shards on disk, kept current on write/delete
+	mu          sync.Mutex
+	paused      bool // test hook: simulate the node going dark
+	coordURL    string
+	drain       bool
+	lastRefresh time.Time
+	addr        string
+	reach       string
+	quota       int64
+	upBps       int64 // current caps; the buckets enforce them
+	downBps     int64
+	used        int64 // bytes of shards on disk, kept current on write/delete
 }
 
 func New(cfg Config) (*Node, error) {
@@ -374,10 +375,8 @@ func (n *Node) authed(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		pub, err := n.reqAuth.VerifyURI(r, signedURI(r), nil)
-		if err == nil {
-			if _, ok := n.cfg.Pool.Lookup(pub); !ok && !pub.Equal(n.coord) {
-				err = errors.New("not a pool participant")
-			}
+		if err == nil && !n.known(r.Context(), pub) {
+			err = errors.New("not a pool participant")
 		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusUnauthorized)
@@ -385,6 +384,41 @@ func (n *Node) authed(h http.HandlerFunc) http.HandlerFunc {
 		}
 		h(w, r)
 	}
+}
+
+// known reports whether pub belongs to the pool, catching up on the catalog
+// once if it might belong to someone who just joined.
+func (n *Node) known(ctx context.Context, pub ed25519.PublicKey) bool {
+	if pub.Equal(n.coord) {
+		return true
+	}
+	if _, ok := n.cfg.Pool.Lookup(pub); ok {
+		return true
+	}
+	if !n.refreshMembership(ctx) {
+		return false
+	}
+	_, ok := n.cfg.Pool.Lookup(pub)
+	return ok
+}
+
+// refreshMembership pulls new catalog entries when a validly signed request
+// comes from a key this node doesn't know yet, typically a member who
+// joined since the last heartbeat. At most once every few seconds, so
+// strangers can't make the node hammer the coordinator. It reports whether
+// anything new arrived.
+func (n *Node) refreshMembership(ctx context.Context) bool {
+	n.mu.Lock()
+	if time.Since(n.lastRefresh) < 3*time.Second {
+		n.mu.Unlock()
+		return false
+	}
+	n.lastRefresh = time.Now()
+	n.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	got, err := n.cat.Sync(ctx, n.cfg.HTTP, n.coordBase(), n.id.Signer())
+	return err == nil && got > 0
 }
 
 // signedURI is the URI the sender signed. Behind a relay that's the
