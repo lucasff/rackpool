@@ -1,4 +1,10 @@
-# mediapool
+<p align="center">
+  <img src="docs/logo.svg" alt="rackpool" width="460">
+</p>
+
+# rackpool
+
+> The code, binaries and settings still use the working name **mediapool** (`mp`, `mp-node`, `MP_*`); they'll be renamed together later.
 
 A media library that a group of people store together. Each member contributes disk and bandwidth from their own machine (a NAS, a home server, a VPS). Files are encrypted, split into erasure-coded shards and spread across members' nodes. A byte-identical file is stored once for the whole pool, however many people add it.
 
@@ -31,6 +37,8 @@ cd mediapool && docker compose up -d
 **The coordinator address must be reachable by every member:**
 - Forward TCP 7000 on your router, ideally with a dynamic DNS name.
 - If your ISP puts you behind carrier-grade NAT, run the coordinator on a small VPS or behind a tunnel (Cloudflare Tunnel, Tailscale Funnel). It needs little CPU or disk and never sees plaintext.
+
+**Behind CGNAT, or keeping your IP private:** `mp pool init --tunnel --coord-url https://pool.example.com` writes a compose file with [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/). Nothing listens on your router, members only ever see Cloudflare's addresses, and your own node runs relay-only. Members who want the same set `MP_REACH=relay` on their nodes. Cloudflare itself still sees your IP and the (encrypted) traffic, and its terms limit serving lots of video on free plans; see the comments in `deploy/docker-compose.founder-tunnel.yml`.
 
 ## Inviting people
 
@@ -109,5 +117,6 @@ go test -race ./...             # unit and multi-node integration tests
 scripts/demo.sh                 # 15-process pool: dedup, streaming, mass node loss, coordinator recovery
 scripts/join-demo.sh            # pool init → invites → nodes joining with only MP_INVITE
 scripts/compose-demo.sh         # the same pool in Docker containers
+scripts/tunnel-demo.sh          # through a temporary Cloudflare quick tunnel (needs internet)
 (cd rclone && go test ./...)    # rclone backend, including rclone's standard backend test suite
 ```

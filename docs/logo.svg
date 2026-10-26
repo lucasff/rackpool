@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 140" width="520" height="140" role="img" aria-labelledby="t">
+  <title id="t">rackpool</title>
+  <style>
+    .word { fill: #14202e; }
+    .tag  { fill: #5b6878; }
+    .unit { fill: #ffffff; stroke: #1f6fd1; }
+    .slot { fill: #1f6fd1; opacity: .18; }
+    .led  { fill: #19b38a; }
+    @media (prefers-color-scheme: dark) {
+      .word { fill: #eef3f8; }
+      .tag  { fill: #9aa8b8; }
+      .unit { fill: #121a24; stroke: #5b9cf0; }
+      .slot { fill: #5b9cf0; opacity: .28; }
+      .led  { fill: #3fd3a6; }
+    }
+  </style>
+  <defs>
+    <linearGradient id="water" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f8cf0"/>
+      <stop offset="1" stop-color="#14b39a"/>
+    </linearGradient>
+    <clipPath id="badge"><rect x="10" y="10" width="120" height="120" rx="28"/></clipPath>
+  </defs>
+
+  <!-- icon: rack units sinking into a shared pool -->
+  <g clip-path="url(#badge)">
+    <rect x="10" y="10" width="120" height="120" rx="28" fill="url(#water)" opacity=".14"/>
+    <path d="M10 92 C 30 84, 46 100, 70 92 S 110 84, 130 92 V 130 H 10 Z" fill="url(#water)"/>
+    <path d="M10 104 C 30 96, 46 112, 70 104 S 110 96, 130 104" fill="none" stroke="#ffffff" stroke-opacity=".35" stroke-width="2"/>
+  </g>
+  <g stroke-width="3">
+    <rect class="unit" x="34" y="26" width="72" height="18" rx="5"/>
+    <rect class="unit" x="34" y="50" width="72" height="18" rx="5"/>
+    <rect class="unit" x="34" y="74" width="72" height="18" rx="5"/>
+  </g>
+  <g>
+    <rect class="slot" x="42" y="33" width="36" height="4" rx="2"/>
+    <rect class="slot" x="42" y="57" width="36" height="4" rx="2"/>
+    <rect class="slot" x="42" y="81" width="36" height="4" rx="2"/>
+    <circle class="led" cx="94" cy="35" r="3.2"/>
+    <circle class="led" cx="94" cy="59" r="3.2"/>
+    <circle class="led" cx="94" cy="83" r="3.2"/>
+  </g>
+
+  <!-- wordmark -->
+  <text class="word" x="152" y="84" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="58" font-weight="750" letter-spacing="-1.5">rack<tspan fill="url(#water)">pool</tspan></text>
+  <text class="tag" x="155" y="112" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+        font-size="15.5" letter-spacing=".4">one library, stored together, encrypted</text>
+</svg>
