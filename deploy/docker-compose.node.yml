@@ -1,0 +1,31 @@
+# Run one mediapool storage node.
+#
+#   1. Put the pool's pool.json next to this file (your pool admin sends it).
+#   2. Print your node's public key and send it to the admin with your node id:
+#        docker compose -f docker-compose.node.yml run --rm node -print-pubkey
+#   3. Once you're in pool.json, start it:
+#        docker compose -f docker-compose.node.yml up -d
+#
+# Change limits by editing the environment and running `up -d` again. Set
+# MP_DRAIN=true to move your shards to other nodes before leaving the pool.
+services:
+  node:
+    image: mediapool:latest
+    build: ..
+    restart: unless-stopped
+    ports:
+      - "7100:7100"
+    volumes:
+      - ./data:/data              # shards and node.key: put this on the disk you're sharing
+      - ./pool.json:/config/pool.json:ro
+    environment:
+      MP_ID: my-node                       # as registered in pool.json
+      MP_ADDR: http://my-host.example:7100 # how other members reach you
+      MP_COORD: http://coordinator.example:7000
+
+      MP_QUOTA: 2T            # most disk to give the pool (0 = all free space above the reserve)
+      MP_RESERVE: 50G         # always leave this much free
+      MP_UPLOAD_LIMIT: 50M    # Mbit/s you serve to others (0 = unlimited)
+      MP_DOWNLOAD_LIMIT: 200M # Mbit/s for receiving shards (0 = unlimited)
+      MP_MAX_TRANSFERS: 16
+      MP_DRAIN: "false"

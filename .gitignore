@@ -2,3 +2,4 @@ bin/
 *.key
 coord-state.json
 catalog*.log
+deploy/local/

@@ -1,0 +1,5 @@
+bin/
+.git/
+*.key
+*.log
+deploy/local/

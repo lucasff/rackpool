@@ -23,8 +23,21 @@ func HeartbeatSigMessage(nodeID string, body []byte) []byte {
 }
 
 type NodeInfo struct {
-	ID   string `json:"id"`
-	Addr string `json:"addr"` // base URL of the node's shard API
+	ID       string   `json:"id"`
+	Addr     string   `json:"addr"` // base URL of the node's shard API
+	Capacity Capacity `json:"capacity"`
+}
+
+// Capacity is what an operator offers the pool, reported every heartbeat.
+// The node enforces it on its own; the coordinator uses it to place within
+// it. Free is -1 when unknown.
+type Capacity struct {
+	Quota       int64 `json:"quota"`
+	Used        int64 `json:"used"`
+	Free        int64 `json:"free"`
+	Drain       bool  `json:"drain"`
+	UploadBps   int64 `json:"upload_bps"`
+	DownloadBps int64 `json:"download_bps"`
 }
 
 // ShardKey names a stored shard. Root pins which upload of the segment it
@@ -109,6 +122,7 @@ type Task struct {
 	Root       string       `json:"root"`
 	Fetch      []Location   `json:"fetch,omitempty"`
 	SourceBlob []byte       `json:"source_blob,omitempty"`
+	Move       *Location    `json:"move,omitempty"` // copy this one shard as-is
 	Put        []PutTarget  `json:"put"`
 }
 
@@ -190,6 +204,7 @@ type NodeStatus struct {
 	Shards   int       `json:"shards"`
 	Strikes  int       `json:"strikes"`
 	FailProb float64   `json:"fail_prob"`
+	Capacity Capacity  `json:"capacity"`
 	LastSeen time.Time `json:"last_seen"`
 }
 

@@ -167,6 +167,8 @@ const (
 type node struct {
 	entry    auth.NodeEntry
 	addr     string
+	cap      proto.Capacity
+	pledged  int64 // bytes of tickets issued this heartbeat, not yet reflected in cap.Free
 	lastSeen time.Time
 	head     catalog.Head
 	shards   map[proto.ShardKey]shardState
@@ -184,6 +186,11 @@ type segInfo struct {
 	readers      map[string]time.Time // member → last counted read
 	swarmChecked time.Time
 	pending      *pending
+	// refilling is set once lazy repair triggers and cleared when the
+	// segment is back at its floor, so a repair that fell short (some
+	// holders expired a tick later, a push failed) finishes the job instead
+	// of parking just above the trigger line.
+	refilling bool
 }
 
 type pending struct {
@@ -444,10 +451,10 @@ func (c *Coordinator) holders(now time.Time) map[string]map[int][]string {
 // nodes are one failure domain, so running many nodes buys no extra share of
 // any segment. preferBridge puts high-bandwidth bridges first, which is where
 // hot shards belong.
-func (c *Coordinator) pickNodes(n int, excludeOwners map[string]bool, preferBridge bool, now time.Time) []*node {
+func (c *Coordinator) pickNodes(n int, excludeOwners map[string]bool, preferBridge bool, size int64, now time.Time) []*node {
 	var cands []*node
 	for _, nd := range c.nodes {
-		if !excludeOwners[nd.entry.Owner] && c.online(nd, now) && c.trusted(nd) {
+		if !excludeOwners[nd.entry.Owner] && c.online(nd, now) && c.trusted(nd) && c.hasRoom(nd, size) {
 			cands = append(cands, nd)
 		}
 	}
@@ -462,13 +469,22 @@ func (c *Coordinator) pickNodes(n int, excludeOwners map[string]bool, preferBrid
 		return int(c.failProb(n) * 50)
 	}
 	slices.SortFunc(cands, func(a, b *node) int {
-		if preferBridge && a.entry.Bridge != b.entry.Bridge {
-			if a.entry.Bridge {
-				return -1
+		if preferBridge {
+			// Hot shards go where the upload is: bridges first, then the
+			// operators who offered the most bandwidth (0 = uncapped).
+			if a.entry.Bridge != b.entry.Bridge {
+				if a.entry.Bridge {
+					return -1
+				}
+				return 1
 			}
-			return 1
+			if d := cmp.Compare(upRank(b), upRank(a)); d != 0 {
+				return d
+			}
 		}
-		return cmp.Or(cmp.Compare(bucket(a), bucket(b)), cmp.Compare(len(a.shards), len(b.shards)), cmp.Compare(a.entry.ID, b.entry.ID))
+		// Otherwise fill by fraction of offered space used, so a big disk
+		// takes proportionally more shards than a small one.
+		return cmp.Or(cmp.Compare(bucket(a), bucket(b)), cmp.Compare(fill(a), fill(b)), cmp.Compare(a.entry.ID, b.entry.ID))
 	})
 	var out []*node
 	owners := map[string]bool{}
@@ -482,6 +498,32 @@ func (c *Coordinator) pickNodes(n int, excludeOwners map[string]bool, preferBrid
 		}
 	}
 	return out
+}
+
+// hasRoom reports whether n will accept a shard of this size: not draining,
+// and enough reported free space after the tickets already issued to it.
+func (c *Coordinator) hasRoom(n *node, size int64) bool {
+	if n.cap.Drain {
+		return false
+	}
+	return n.cap.Free < 0 || n.cap.Free-n.pledged >= size
+}
+
+// fill is the fraction of a node's offered space in use; unknown capacity
+// ranks by shard count instead.
+func fill(n *node) float64 {
+	total := n.cap.Used + n.cap.Free
+	if n.cap.Free < 0 || total <= 0 {
+		return float64(len(n.shards))
+	}
+	return float64(n.cap.Used+n.pledged) / float64(total)
+}
+
+func upRank(n *node) int64 {
+	if n.cap.UploadBps == 0 {
+		return math.MaxInt64
+	}
+	return n.cap.UploadBps
 }
 
 func (c *Coordinator) onlineBridge(now time.Time) *node {
@@ -529,6 +571,10 @@ func (c *Coordinator) lossOf(holders []*node) float64 {
 	return reliability.LossProb(q, c.cfg.Params.K)
 }
 
+func (c *Coordinator) shardSize(s catalog.Segment) int64 {
+	return int64(codec.ShardSize(c.cfg.Params, s.CipherSize))
+}
+
 func location(n *node, idx int) proto.Location {
 	return proto.Location{Index: idx, NodeID: n.entry.ID, Addr: n.addr}
 }
@@ -539,6 +585,7 @@ func (c *Coordinator) ticket(n *node, seg string, idx int, root string, size int
 		K: c.cfg.Params.K, MaxN: c.cfg.Params.MaxN, ExpMs: now.Add(c.cfg.TicketTTL).UnixMilli(),
 	}
 	t.Sign(c.cfg.Key)
+	n.pledged += int64(codec.ShardSize(c.cfg.Params, size))
 	return proto.PutTarget{Location: location(n, idx), Ticket: t}
 }
 
@@ -588,6 +635,9 @@ func (c *Coordinator) schedule(s catalog.Segment, byIdx map[int][]string, now ti
 	if si.pending != nil {
 		return
 	}
+	if c.evacuate(s, si, byIdx, now) {
+		return
+	}
 
 	alive := map[int]bool{}
 	var online []proto.Location
@@ -627,10 +677,15 @@ func (c *Coordinator) schedule(s catalog.Segment, byIdx map[int][]string, now ti
 		}
 		c.repair(s, si, have, online, owners, target-len(online), extra > 0, now)
 	case len(alive) < base-c.cfg.RepairSlack,
+		si.refilling && len(alive) < base,
 		extra > 0 && len(alive) < target:
+		si.refilling = true
 		c.repair(s, si, alive, online, owners, target-len(alive), extra > 0, now)
 	case len(alive) > target+c.cfg.ShrinkSlack:
 		c.shrink(s, byIdx, len(alive)-target)
+	}
+	if len(alive) >= base {
+		si.refilling = false
 	}
 	c.dropDuplicates(s, byIdx, now)
 }
@@ -661,7 +716,7 @@ func (c *Coordinator) scheduleByLoss(s catalog.Segment, si *segInfo, byIdx map[i
 	// How many more holders would bring the estimate under target, picking
 	// the candidates placement would actually choose.
 	need := func(base []*node, excl map[string]bool) int {
-		cands := c.pickNodes(maxN, excl, false, now)
+		cands := c.pickNodes(maxN, excl, false, c.shardSize(s), now)
 		cur := slices.Clone(base)
 		added := 0
 		for (len(cur) < c.cfg.MinN || c.lossOf(cur) > target) && added < len(cands) && len(cur) < maxN {
@@ -723,6 +778,63 @@ func (c *Coordinator) scheduleByLoss(s catalog.Segment, si *segInfo, byIdx map[i
 	c.dropDuplicates(s, byIdx, now)
 }
 
+// evacuate moves one shard off a node that is draining or over its quota.
+// The shard is copied to a new holder first; the old copy is deleted only
+// once the new one is credited, so evacuation never lowers durability. It
+// returns true if it scheduled work for this segment.
+func (c *Coordinator) evacuate(s catalog.Segment, si *segInfo, byIdx map[int][]string, now time.Time) bool {
+	for idx, ids := range byIdx {
+		var leaving, staying []string
+		for _, id := range ids {
+			n := c.nodes[id]
+			if n.cap.Drain || (n.cap.Quota > 0 && n.cap.Used > n.cap.Quota) {
+				leaving = append(leaving, id)
+			} else {
+				staying = append(staying, id)
+			}
+		}
+		if len(leaving) == 0 {
+			continue
+		}
+		if len(staying) > 0 {
+			// Already copied: let go of the leaving copies.
+			for _, id := range leaving {
+				c.deleteShard(c.nodes[id], proto.ShardKey{Segment: s.ID, Index: idx, Root: s.ShardRoot})
+			}
+			return true
+		}
+		src := c.nodes[leaving[0]]
+		if !c.online(src, now) {
+			continue
+		}
+		owners := map[string]bool{}
+		for _, ids := range byIdx {
+			for _, id := range ids {
+				if !slices.Contains(leaving, id) {
+					owners[c.nodes[id].entry.Owner] = true
+				}
+			}
+		}
+		dst := c.pickNodes(1, owners, false, c.shardSize(s), now)
+		if len(dst) == 0 {
+			continue // nowhere to go yet; keep it where it is
+		}
+		// A move is a single shard copy: the destination fetches it from the
+		// leaving node and stores it under a ticket, no decoding needed.
+		c.taskSeq++
+		task := proto.Task{
+			ID: "t" + strconv.Itoa(c.taskSeq), Segment: s.ID, CipherSize: s.CipherSize, Params: c.cfg.Params, Root: s.ShardRoot,
+			Move: &proto.Location{Index: idx, NodeID: src.entry.ID, Addr: src.addr},
+			Put:  []proto.PutTarget{c.ticket(dst[0], s.ID, idx, s.ShardRoot, s.CipherSize, now)},
+		}
+		dst[0].tasks = append(dst[0].tasks, task)
+		si.pending = &pending{taskID: task.ID, nodeID: dst[0].entry.ID, deadline: now.Add(c.cfg.TaskTimeout)}
+		c.cfg.Logf("segment %.12s: moving shard %d off %s to %s (%s)", s.ID, idx, src.entry.ID, dst[0].entry.ID, task.ID)
+		return true
+	}
+	return false
+}
+
 // scheduleSwarmCheck asks a bridge about a segment's torrent. A segment that
 // isn't anchored needs a verify check (rebuild from the swarm and match);
 // once anchored, liveness checks keep it there.
@@ -744,7 +856,7 @@ func (c *Coordinator) repair(s catalog.Segment, si *segInfo, have map[int]bool, 
 			missing = append(missing, i)
 		}
 	}
-	targets := c.pickNodes(len(missing), owners, hot, now)
+	targets := c.pickNodes(len(missing), owners, hot, c.shardSize(s), now)
 	if len(targets) == 0 {
 		return
 	}
@@ -1019,6 +1131,7 @@ func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, _ *http.Request, p 
 	}
 	c.cfg.Reliability.Heartbeat(c.score(p.Node.Owner), n.lastSeen, now)
 	n.entry, n.addr, n.lastSeen, n.head = *p.Node, req.Node.Addr, now, req.Head
+	n.cap, n.pledged = req.Node.Capacity, 0
 
 	// Reconcile the inventory. Shards no longer reported are gone. New ones
 	// start unverified and count only after a storage proof, so a node can't
@@ -1177,7 +1290,7 @@ func (c *Coordinator) handlePrepare(w http.ResponseWriter, _ *http.Request, _ au
 		return
 	}
 
-	targets := c.pickNodes(c.cfg.OrphanN, nil, false, now)
+	targets := c.pickNodes(c.cfg.OrphanN, nil, false, int64(codec.ShardSize(c.cfg.Params, req.CipherSize)), now)
 	if len(targets) < c.cfg.Params.K {
 		http.Error(w, fmt.Sprintf("only %d failure domains online, need at least k=%d", len(targets), c.cfg.Params.K), http.StatusServiceUnavailable)
 		return
@@ -1359,7 +1472,7 @@ func (c *Coordinator) Status() proto.StatusResponse {
 		out.Nodes = append(out.Nodes, proto.NodeStatus{
 			ID: n.entry.ID, Owner: n.entry.Owner, Addr: n.addr, Bridge: n.entry.Bridge,
 			Online: c.online(n, now), Shards: len(n.shards), Strikes: n.strikes, LastSeen: n.lastSeen,
-			FailProb: c.failProb(n),
+			FailProb: c.failProb(n), Capacity: n.cap,
 		})
 	}
 	for _, s := range c.cat.LiveSegments() {

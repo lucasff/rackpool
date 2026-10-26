@@ -771,3 +771,130 @@ func TestRedundancyFollowsReliability(t *testing.T) {
 		t.Fatal("data unreadable after holders rotted")
 	}
 }
+
+// --- operator controls --------------------------------------------------
+
+func (c *cluster) node(id string) *node.Node {
+	for _, n := range c.nodes {
+		if n.ID() == id {
+			return n
+		}
+	}
+	c.t.Fatalf("no node %s", id)
+	return nil
+}
+
+func (c *cluster) usedBy(n *node.Node) int64 { return n.Capacity().Used }
+
+// A node with a small quota never stores more than it offered, and the
+// coordinator stops placing on it once it's full.
+func TestQuotaIsRespected(t *testing.T) {
+	c := newCluster(t, 14, nil)
+	small := c.node("n00")
+	shard := int64(codec.ShardSize(codec.Params{K: 4, MaxN: 12}, 64<<10+16))
+	small.SetLimits(2*shard, 0, 0, false) // room for two shards
+	c.heartbeat()
+
+	for i := range 6 {
+		if _, err := c.client.Add(c.ctx, bytes.NewReader(randomFile(t, 64<<10)), fmt.Sprintf("/f%d", i), nil); err != nil {
+			t.Fatal(err)
+		}
+		c.heartbeat()
+	}
+	c.cycle(3)
+	if used := c.usedBy(small); used > 2*shard {
+		t.Fatalf("node stored %d bytes past its %d quota", used, 2*shard)
+	}
+	for _, s := range c.coord.Status().Segments {
+		if s.Durable < 9 {
+			t.Fatalf("segment under-placed because of one small node: %+v", s)
+		}
+	}
+}
+
+// Draining moves every shard off a node before deleting it, so durability
+// never dips, and the node ends up empty.
+func TestDrainEmptiesNodeWithoutLosingDurability(t *testing.T) {
+	c := newCluster(t, 14, nil)
+	data := randomFile(t, 128<<10) // 2 segments
+	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/x", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.settle("placed", 5*time.Second, func(s proto.SegmentStatus) bool { return s.Durable == 9 })
+
+	var leaving *node.Node
+	for _, n := range c.nodes {
+		if inv, _ := n.Inventory(); len(inv) > 0 && !n.IsBridge() {
+			leaving = n
+			break
+		}
+	}
+	leaving.SetLimits(0, 0, 0, true)
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		c.heartbeat()
+		c.coord.Tick()
+		for _, s := range c.coord.Status().Segments {
+			if s.Durable < 9 {
+				t.Fatalf("durability dipped during drain: %+v", s)
+			}
+		}
+		if inv, _ := leaving.Inventory(); len(inv) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			inv, _ := leaving.Inventory()
+			t.Fatalf("drain incomplete: %d shards left", len(inv))
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	if !bytes.Equal(c.readBack(c.client, "/x"), data) {
+		t.Fatal("data unreadable after drain")
+	}
+	if used := leaving.Capacity().Used; used != 0 {
+		t.Fatalf("drained node still accounts %d bytes used", used)
+	}
+}
+
+// The upload cap throttles shard serving.
+func TestUploadCapThrottles(t *testing.T) {
+	c := newCluster(t, 12, nil)
+	c.client.SegmentSize = 8 << 20
+	data := randomFile(t, 8<<20) // one segment, 2 MiB shards
+	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/big", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.settle("placed", 5*time.Second, func(s proto.SegmentStatus) bool { return s.Durable == 9 })
+	for _, n := range c.nodes {
+		n.SetLimits(0, 2<<20, 0, false) // 2 MiB/s each
+	}
+	c.heartbeat() // keep nodes online for the coordinator under -race slowdowns
+
+	// 4 shards of 2 MiB from 4 nodes in parallel at 2 MiB/s each, less the
+	// 0.5 MiB burst allowance: at least ~0.75 s. Uncapped it's milliseconds.
+	start := time.Now()
+	if !bytes.Equal(c.readBack(c.client, "/big"), data) {
+		t.Fatal("mismatch")
+	}
+	if d := time.Since(start); d < 650*time.Millisecond {
+		t.Fatalf("capped read finished in %v; throttle not applied", d)
+	}
+}
+
+// Lazy repair that falls short (here: holders expire one tick apart, so the
+// first repair is sized for a partial loss) must still end at the floor, not
+// park just above the trigger line.
+func TestPartialRepairIsToppedUp(t *testing.T) {
+	c := newCluster(t, 14, nil)
+	data := randomFile(t, 50<<10)
+	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/x", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.settle("placed", 5*time.Second, func(s proto.SegmentStatus) bool { return s.Durable == 9 })
+	c.pauseHolders(7) // first wave: 2 holders gone, 7 left (below 9-1)
+	c.settle("first repair done", 5*time.Second, func(s proto.SegmentStatus) bool { return s.Online >= 8 && !s.Repairing })
+	c.pauseHolders(7) // second wave from the repaired set
+	c.settle("back at the floor", 10*time.Second, func(s proto.SegmentStatus) bool {
+		return s.Durable == 9 && s.Online == 9 && !s.Repairing
+	})
+}

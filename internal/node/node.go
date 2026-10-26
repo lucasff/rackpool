@@ -32,6 +32,8 @@ import (
 	"mediapool/internal/bridge"
 	"mediapool/internal/catalog"
 	"mediapool/internal/codec"
+	"mediapool/internal/diskfree"
+	"mediapool/internal/limits"
 	"mediapool/internal/proto"
 	"mediapool/internal/transfer"
 )
@@ -50,6 +52,18 @@ type Config struct {
 	// compromised coordinator can only shrink a disk slowly.
 	DeleteBudget int
 
+	// Operator controls. Quota caps shard storage (0 = only the disk and
+	// Reserve limit it); Reserve is free disk the node never fills. Upload
+	// and download caps are bytes/s shared by all traffic (0 = unlimited).
+	// MaxTransfers caps concurrent shard transfers. Drain asks the pool to
+	// move every shard elsewhere, which is how an operator leaves cleanly.
+	Quota        int64
+	Reserve      int64
+	UploadBps    int64
+	DownloadBps  int64
+	MaxTransfers int
+	Drain        bool
+
 	// Bridge settings. Source being non-nil makes this a bridge node; the
 	// pool file must also grant it the bridge role.
 	PoolSecret []byte
@@ -66,9 +80,15 @@ type Node struct {
 	cat     *catalog.Catalog
 	reqAuth auth.Verifier
 
+	up, down *limits.Bucket
+	slots    chan struct{}
+
 	mu       sync.Mutex
 	paused   bool // test hook: simulate the node going dark
 	coordURL string
+	drain    bool
+	quota    int64
+	used     int64 // bytes of shards on disk, kept current on write/delete
 }
 
 func New(cfg Config) (*Node, error) {
@@ -84,8 +104,14 @@ func New(cfg Config) (*Node, error) {
 	if cfg.DeleteBudget == 0 {
 		cfg.DeleteBudget = 64
 	}
+	if cfg.MaxTransfers == 0 {
+		cfg.MaxTransfers = 16
+	}
+	up, down := limits.NewBucket(cfg.UploadBps), limits.NewBucket(cfg.DownloadBps)
 	if cfg.HTTP == nil {
-		cfg.HTTP = &http.Client{Timeout: 2 * time.Minute}
+		// Outgoing traffic (pushing rebuilt shards, fetching shards to
+		// rebuild, syncing the catalog) shares the operator's caps.
+		cfg.HTTP = &http.Client{Timeout: 10 * time.Minute, Transport: &limits.Transport{Up: up, Down: down}}
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
@@ -101,7 +127,95 @@ func New(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Node{cfg: cfg, id: auth.NewIdentity(cfg.Key), coord: coord, cat: cat, coordURL: cfg.CoordURL}, nil
+	n := &Node{
+		cfg: cfg, id: auth.NewIdentity(cfg.Key), coord: coord, cat: cat, coordURL: cfg.CoordURL,
+		up: up, down: down, slots: make(chan struct{}, cfg.MaxTransfers),
+		drain: cfg.Drain, quota: cfg.Quota,
+	}
+	if n.used, err = n.diskUsage(); err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
+// SetLimits changes the operator controls while running. Lowering the quota
+// below current usage makes the pool move shards off this node.
+func (n *Node) SetLimits(quota, uploadBps, downloadBps int64, drain bool) {
+	n.mu.Lock()
+	n.quota, n.drain = quota, drain
+	n.mu.Unlock()
+	n.up.SetRate(uploadBps)
+	n.down.SetRate(downloadBps)
+}
+
+func (n *Node) diskUsage() (int64, error) {
+	var total int64
+	err := filepath.WalkDir(filepath.Join(n.cfg.DataDir, "shards"), func(_ string, d os.DirEntry, err error) error {
+		// Count shard data only, the same bytes reserve and release track;
+		// proofs and partial writes are small and not part of the quota.
+		if err != nil || d.IsDir() || strings.Contains(d.Name(), ".proof") || strings.HasSuffix(d.Name(), ".tmp") {
+			return err
+		}
+		if fi, err := d.Info(); err == nil {
+			total += fi.Size()
+		}
+		return nil
+	})
+	return total, err
+}
+
+// Capacity reports what this node offers the pool right now.
+func (n *Node) Capacity() proto.Capacity {
+	n.mu.Lock()
+	quota, used, drain := n.quota, n.used, n.drain
+	n.mu.Unlock()
+	avail := int64(-1)
+	if free, err := diskfree.Free(n.cfg.DataDir); err == nil {
+		avail = max(0, free-n.cfg.Reserve)
+	}
+	if quota > 0 {
+		if q := max(0, quota-used); avail < 0 || q < avail {
+			avail = q
+		}
+	}
+	return proto.Capacity{
+		Quota: quota, Used: used, Free: avail, Drain: drain,
+		UploadBps: n.cfg.UploadBps, DownloadBps: n.cfg.DownloadBps,
+	}
+}
+
+// reserve claims room for size more bytes, refusing past quota or reserve.
+func (n *Node) reserve(size int64) error {
+	c := n.Capacity()
+	if c.Drain {
+		return errors.New("node is draining")
+	}
+	if c.Free >= 0 && size > c.Free {
+		return fmt.Errorf("node is full (%s free)", limits.FormatBytes(c.Free))
+	}
+	n.mu.Lock()
+	n.used += size
+	n.mu.Unlock()
+	return nil
+}
+
+func (n *Node) release(size int64) {
+	n.mu.Lock()
+	n.used = max(0, n.used-size)
+	n.mu.Unlock()
+}
+
+// slot limits concurrent transfers; it returns false when the request
+// should be refused with 503 so the caller tries another holder.
+func (n *Node) slot(r *http.Request) (func(), bool) {
+	select {
+	case n.slots <- struct{}{}:
+		return func() { <-n.slots }, true
+	case <-r.Context().Done():
+		return nil, false
+	case <-time.After(5 * time.Second):
+		return nil, false
+	}
 }
 
 func (n *Node) DataDir() string           { return n.cfg.DataDir }
@@ -187,6 +301,9 @@ func (n *Node) readShard(k proto.ShardKey) ([]byte, string, error) {
 
 func (n *Node) removeShard(k proto.ShardKey) {
 	p := n.shardPath(k)
+	if fi, err := os.Stat(p); err == nil {
+		n.release(fi.Size())
+	}
 	_ = os.Remove(p)
 	_ = os.Remove(p + ".proof")
 	_ = os.Remove(filepath.Dir(p)) // only succeeds once empty
@@ -264,8 +381,15 @@ func (n *Node) handleGet(w http.ResponseWriter, r *http.Request) {
 			http.NotFound(w, r)
 			return
 		}
+		done, ok := n.slot(r)
+		if !ok {
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		defer done()
 		w.Header().Set(transfer.ProofHeader, proof)
-		_, _ = w.Write(data)
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = limits.Writer{Ctx: r.Context(), W: w, B: n.up}.Write(data)
 	})(w, r)
 }
 
@@ -297,7 +421,29 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit := int64(codec.ShardSize(t.Params(), t.CipherSize))
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	if _, err := os.Stat(n.shardPath(k)); err == nil {
+		io.Copy(io.Discard, io.LimitReader(r.Body, limit))
+		w.WriteHeader(http.StatusCreated) // already have it
+		return
+	}
+	if err := n.reserve(limit); err != nil {
+		http.Error(w, err.Error(), http.StatusInsufficientStorage)
+		return
+	}
+	stored := false
+	defer func() {
+		if !stored {
+			n.release(limit)
+		}
+	}()
+	done, ok := n.slot(r)
+	if !ok {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer done()
+	body := &throttled{ctx: r.Context(), r: http.MaxBytesReader(w, r.Body, limit), b: n.down}
+	data, err := io.ReadAll(body)
 	if err != nil || int64(len(data)) != limit {
 		http.Error(w, "shard has the wrong size", http.StatusBadRequest)
 		return
@@ -313,7 +459,27 @@ func (n *Node) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	stored = true
 	w.WriteHeader(http.StatusCreated)
+}
+
+type throttled struct {
+	ctx context.Context
+	r   io.Reader
+	b   *limits.Bucket
+}
+
+func (t *throttled) Read(p []byte) (int, error) {
+	if len(p) > 32<<10 {
+		p = p[:32<<10]
+	}
+	m, err := t.r.Read(p)
+	if m > 0 {
+		if werr := t.b.Wait(t.ctx, m); werr != nil {
+			return m, werr
+		}
+	}
+	return m, err
 }
 
 // handleProof answers a storage challenge: chunk c of a shard with Merkle
@@ -390,7 +556,7 @@ func (n *Node) HeartbeatOnce(ctx context.Context) error {
 		return err
 	}
 	req := proto.HeartbeatRequest{
-		Node:      proto.NodeInfo{ID: n.cfg.ID, Addr: n.cfg.Addr},
+		Node:      proto.NodeInfo{ID: n.cfg.ID, Addr: n.cfg.Addr, Capacity: n.Capacity()},
 		Head:      n.cat.Head(),
 		Inventory: inv,
 	}
@@ -493,6 +659,9 @@ func (n *Node) execute(ctx context.Context, t proto.Task) ([]proto.Location, err
 	if err != nil {
 		return nil, err
 	}
+	if t.Move != nil {
+		return n.move(ctx, t, root)
+	}
 	var shards [][]byte
 	if t.SourceBlob != nil {
 		shards, err = n.rebuildFromSwarm(ctx, t)
@@ -519,6 +688,26 @@ func (n *Node) execute(ctx context.Context, t proto.Task) ([]proto.Location, err
 		placed = append(placed, p.Location)
 	}
 	return placed, errors.Join(errs...)
+}
+
+// move copies one shard from a leaving node to the task's target (usually
+// this node), verifying it against the segment root on the way.
+func (n *Node) move(ctx context.Context, t proto.Task, root [32]byte) ([]proto.Location, error) {
+	if len(t.Put) != 1 || t.Put[0].Index != t.Move.Index {
+		return nil, errors.New("malformed move task")
+	}
+	data, proof, err := transfer.GetShard(ctx, n.cfg.HTTP, n.id, t.Move.Addr, t.Segment, t.Move.Index, t.Root)
+	if err != nil {
+		return nil, err
+	}
+	if !codec.VerifyShard(root, t.Params.MaxN, t.Move.Index, data, proof) {
+		return nil, errors.New("moved shard doesn't verify")
+	}
+	p := t.Put[0]
+	if err := transfer.PutShard(ctx, n.cfg.HTTP, p.Addr, t.Segment, p.Index, data, proof, &p.Ticket); err != nil {
+		return nil, err
+	}
+	return []proto.Location{p.Location}, nil
 }
 
 func (n *Node) rebuildFromPool(ctx context.Context, t proto.Task, root [32]byte) ([][]byte, error) {

@@ -3,11 +3,14 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 
 	"mediapool/internal/auth"
 	"mediapool/internal/coord"
+	"mediapool/internal/envflag"
 )
 
 func main() {
@@ -32,15 +35,23 @@ func main() {
 	flag.DurationVar(&cfg.SwarmCheckEvery, "swarm-check-every", cfg.SwarmCheckEvery, "how often bridges re-check external swarms")
 	flag.DurationVar(&cfg.GCGrace, "gc-grace", cfg.GCGrace, "how long a segment sits unreferenced before collection")
 	flag.DurationVar(&cfg.TickEvery, "tick", cfg.TickEvery, "scheduler interval")
-	flag.Parse()
+	pubkey := flag.Bool("print-pubkey", false, "print the coordinator's public key (creating the key if needed) and exit")
+	if err := envflag.Parse(flag.CommandLine, os.Args[1:]); err != nil {
+		log.Fatal(err)
+	}
 	cfg.Logf = log.Printf
 	cfg.Reliability.OfflineAfter = cfg.OfflineAfter
 
-	pool, err := auth.LoadPool(*poolPath)
-	if err != nil {
+	var err error
+	if cfg.Key, err = auth.LoadOrCreateKey(*keyPath); err != nil {
 		log.Fatal(err)
 	}
-	if cfg.Key, err = auth.LoadOrCreateKey(*keyPath); err != nil {
+	if *pubkey {
+		fmt.Println(auth.PubHex(cfg.Key))
+		return
+	}
+	pool, err := auth.LoadPool(*poolPath)
+	if err != nil {
 		log.Fatal(err)
 	}
 	cfg.Pool = pool
@@ -49,7 +60,10 @@ func main() {
 		log.Fatal(err)
 	}
 	go c.Run(make(chan struct{}))
+	mux := http.NewServeMux()
+	mux.Handle("/v1/", c.Handler())
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	log.Printf("coordinator on %s (k=%d anchored=%d orphan=%d max=%d, %d members, %d nodes)",
 		*listen, cfg.Params.K, cfg.AnchoredN, cfg.OrphanN, cfg.Params.MaxN, len(pool.Members), len(pool.Nodes))
-	log.Fatal(http.ListenAndServe(*listen, c.Handler()))
+	log.Fatal(http.ListenAndServe(*listen, mux))
 }

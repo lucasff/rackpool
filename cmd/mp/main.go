@@ -19,6 +19,7 @@ import (
 
 	"mediapool/internal/auth"
 	"mediapool/internal/client"
+	"mediapool/internal/envflag"
 	"mediapool/internal/proto"
 	"mediapool/internal/transfer"
 )
@@ -44,7 +45,9 @@ func main() {
 	keyPath := flag.String("key", "member.key", "your private key")
 	catPath := flag.String("catalog", "", "local catalog replica (default: memory only)")
 	flag.Usage = func() { fmt.Fprintln(os.Stderr, usage) }
-	flag.Parse()
+	if err := envflag.Parse(flag.CommandLine, os.Args[1:]); err != nil {
+		log.Fatal(err)
+	}
 	if flag.NArg() < 1 {
 		flag.Usage()
 		os.Exit(2)
@@ -194,9 +197,17 @@ func status(ctx context.Context, coordURL string, id *auth.Identity) error {
 	if st.WriteBlocked != "" {
 		fmt.Fprintf(tw, " (WRITES BLOCKED: %s)", st.WriteBlocked)
 	}
-	fmt.Fprintf(tw, "\n\nNODE\tOWNER\tONLINE\tBRIDGE\tSHARDS\tSTRIKES\tFAIL-P\n")
+	fmt.Fprintf(tw, "\n\nNODE\tOWNER\tONLINE\tBRIDGE\tSHARDS\tUSED\tFREE\tUP\tDRAIN\tSTRIKES\tFAIL-P\n")
 	for _, n := range st.Nodes {
-		fmt.Fprintf(tw, "%s\t%s\t%v\t%v\t%d\t%d\t%.3f\n", n.ID, n.Owner, n.Online, n.Bridge, n.Shards, n.Strikes, n.FailProb)
+		free, up := "?", "∞"
+		if n.Capacity.Free >= 0 {
+			free = human(n.Capacity.Free)
+		}
+		if n.Capacity.UploadBps > 0 {
+			up = fmt.Sprintf("%.0fMbit", float64(n.Capacity.UploadBps)*8/1e6)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%v\t%v\t%d\t%s\t%s\t%s\t%v\t%d\t%.3f\n", n.ID, n.Owner, n.Online, n.Bridge, n.Shards,
+			human(n.Capacity.Used), free, up, n.Capacity.Drain, n.Strikes, n.FailProb)
 	}
 	fmt.Fprintf(tw, "\nSEGMENT\tCLASS\tREFS\tONLINE/DURABLE/TARGET\tLOSS-P\tHEAT(reads/min)\tREPAIRING\n")
 	for _, s := range st.Segments {
