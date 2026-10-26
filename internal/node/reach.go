@@ -17,8 +17,10 @@ import (
 // ReachOptions controls how the node makes itself reachable.
 type ReachOptions struct {
 	// Mode: "auto" tries direct addresses and falls back to the relay;
-	// "direct" never relays; "relay" always relays; "off" advertises
-	// Config.Addr unchecked (local setups and tests).
+	// "direct" never relays; "relay" always relays; "announce" checks only
+	// Announce (no STUN, no port mapping, so the coordinator never learns
+	// this machine's IP: for nodes behind their own tunnel); "off"
+	// advertises Config.Addr unchecked (local setups and tests).
 	Mode string
 	// ListenPort is the TCP port the node's HTTP server listens on.
 	ListenPort int
@@ -29,8 +31,13 @@ type ReachOptions struct {
 	PortMap bool
 	// RelayURL is the relay to use when nothing direct works.
 	RelayURL string
-	STUN     []string
-	Recheck  time.Duration
+	// RelayPublicURL is the relay's address as other members reach it, if
+	// it differs from RelayURL (e.g. the founder's node talks to its
+	// coordinator over the Docker network, while members go through a
+	// tunnel). Default: RelayURL.
+	RelayPublicURL string
+	STUN           []string
+	Recheck        time.Duration
 }
 
 // ReachReport is what the last reachability check found.
@@ -110,7 +117,9 @@ func (n *Node) checkReach(ctx context.Context, o ReachOptions) {
 			cands, kind[u] = append(cands, u), k
 		}
 	}
-	if o.Mode != "relay" {
+	if o.Mode == "announce" {
+		add(o.Announce, "direct")
+	} else if o.Mode != "relay" {
 		add(o.Announce, "direct")
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		for _, s := range o.STUN {
@@ -177,7 +186,7 @@ func (n *Node) checkReach(ctx context.Context, o ReachOptions) {
 		n.cfg.Logf("reachable directly at %s (%s)", rep.Addr, rep.Reach)
 		return
 	}
-	if o.Mode == "direct" || o.RelayURL == "" {
+	if o.Mode == "direct" || o.Mode == "announce" || o.RelayURL == "" {
 		rep.Suggestion = suggestion(rep, o)
 		addr, _ := n.Addr()
 		rep.Addr = addr
@@ -185,7 +194,11 @@ func (n *Node) checkReach(ctx context.Context, o ReachOptions) {
 		n.cfg.Logf("not reachable from the internet. %s", rep.Suggestion)
 		return
 	}
-	rep.Addr, rep.Reach = relay.AddrFor(o.RelayURL, n.cfg.ID), "relay"
+	public := o.RelayPublicURL
+	if public == "" {
+		public = o.RelayURL
+	}
+	rep.Addr, rep.Reach = relay.AddrFor(public, n.cfg.ID), "relay"
 	if o.Mode == "auto" {
 		rep.Suggestion = suggestion(rep, o)
 	}

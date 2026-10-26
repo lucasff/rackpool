@@ -1,7 +1,9 @@
 // Package relay makes nodes behind carrier-grade NAT reachable. Such a node
-// can't accept connections, so it dials out to a relay and keeps the
-// connection open; the relay serves /relay/<node-id>/... on its behalf and
-// forwards each request down that connection (multiplexed with yamux).
+// can't accept connections, so it dials out to a relay and keeps a
+// WebSocket open; the relay serves /relay/<node-id>/... on its behalf and
+// forwards each request down that connection (multiplexed with yamux). A
+// WebSocket passes through reverse proxies and Cloudflare Tunnel, so the
+// relay can sit behind one.
 //
 // A relay is trusted for availability only. Shards are ciphertext verified
 // against Merkle roots, requests to nodes are signed end to end, and upload
@@ -11,7 +13,6 @@
 package relay
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/hashicorp/yamux"
 
 	"mediapool/internal/auth"
@@ -108,25 +110,18 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "only pool nodes can use the relay", http.StatusForbidden)
 		return
 	}
-	if !strings.EqualFold(r.Header.Get("Upgrade"), upgradeProto) {
-		http.Error(w, "expected Upgrade: "+upgradeProto, http.StatusBadRequest)
-		return
-	}
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "relay can't hijack this connection", http.StatusInternalServerError)
-		return
-	}
-	conn, brw, err := hj.Hijack()
+	// A real WebSocket, so the tunnel passes through proxies and CDNs that
+	// only forward WebSocket upgrades (Cloudflare Tunnel among them).
+	ws, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		Subprotocols:    []string{upgradeProto},
+		CompressionMode: websocket.CompressionDisabled,
+	})
 	if err != nil {
 		return
 	}
-	fmt.Fprintf(brw, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: %s\r\nConnection: Upgrade\r\n\r\n", upgradeProto)
-	if err := brw.Flush(); err != nil {
-		conn.Close()
-		return
-	}
-	sess, err := yamux.Client(&bufConn{Conn: conn, r: brw.Reader}, yamuxConfig())
+	ws.SetReadLimit(-1)
+	conn := websocket.NetConn(context.Background(), ws, websocket.MessageBinary)
+	sess, err := yamux.Client(conn, yamuxConfig())
 	if err != nil {
 		conn.Close()
 		return
@@ -180,13 +175,6 @@ func yamuxConfig() *yamux.Config {
 	return c
 }
 
-type bufConn struct {
-	net.Conn
-	r *bufio.Reader
-}
-
-func (c *bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
-
 // AddrFor returns the URL other members use to reach nodeID through the
 // relay at relayURL.
 func AddrFor(relayURL, nodeID string) string {
@@ -218,45 +206,37 @@ func Serve(ctx context.Context, relayURL string, id *auth.Identity, h http.Handl
 }
 
 func serveOnce(ctx context.Context, relayURL string, id *auth.Identity, h http.Handler, connected func(bool)) error {
-	u, err := url.Parse(relayURL)
+	u, err := url.Parse(strings.TrimRight(relayURL, "/") + connectPath)
 	if err != nil {
 		return err
 	}
-	if u.Scheme != "http" {
-		return fmt.Errorf("relay URL scheme %q not supported yet (use http behind a TLS-terminating proxy)", u.Scheme)
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+		return fmt.Errorf("relay URL must be http:// or https://, got %q", relayURL)
 	}
-	host := u.Host
-	if u.Port() == "" {
-		host += ":80"
-	}
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", host)
+	// Sign the request as the relay will see it: GET on the connect path.
+	signed, _ := http.NewRequest(http.MethodGet, strings.TrimRight(relayURL, "/")+connectPath, nil)
+	id.Sign(signed, nil)
+	dctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ws, resp, err := websocket.Dial(dctx, u.String(), &websocket.DialOptions{
+		HTTPHeader:      http.Header{"Authorization": signed.Header.Values("Authorization")},
+		Subprotocols:    []string{upgradeProto},
+		CompressionMode: websocket.CompressionDisabled,
+	})
+	cancel()
 	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("relay refused: %s", resp.Status)
+		}
 		return err
 	}
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	defer stop()
-
-	req, _ := http.NewRequest(http.MethodGet, strings.TrimRight(relayURL, "/")+connectPath, nil)
-	req.Header.Set("Upgrade", upgradeProto)
-	req.Header.Set("Connection", "Upgrade")
-	id.Sign(req, nil)
-	if err := req.Write(conn); err != nil {
-		conn.Close()
-		return err
-	}
-	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, req)
-	if err != nil {
-		conn.Close()
-		return err
-	}
-	if resp.StatusCode != http.StatusSwitchingProtocols {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		conn.Close()
-		return fmt.Errorf("relay refused: %s: %s", resp.Status, strings.TrimSpace(string(b)))
-	}
-	sess, err := yamux.Server(&bufConn{Conn: conn, r: br}, yamuxConfig())
+	ws.SetReadLimit(-1)
+	conn := websocket.NetConn(ctx, ws, websocket.MessageBinary)
+	sess, err := yamux.Server(conn, yamuxConfig())
 	if err != nil {
 		conn.Close()
 		return err
@@ -264,6 +244,8 @@ func serveOnce(ctx context.Context, relayURL string, id *auth.Identity, h http.H
 	connected(true)
 	defer connected(false)
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: 30 * time.Second}
+	stop := context.AfterFunc(ctx, func() { sess.Close() })
+	defer stop()
 	err = srv.Serve(sess)
 	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, io.EOF) {
 		err = errors.New("tunnel closed")

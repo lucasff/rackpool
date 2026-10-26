@@ -1,0 +1,43 @@
+# Founder: the pool's coordinator and your storage node, reachable through a
+# port forward. Written by `mp pool init`, which also writes .env next to it.
+#
+# Forward TCP 7000 (coordinator) and 7100 (node) on your router to this
+# machine. If you can't (carrier-grade NAT) or don't want your IP address
+# visible to members, use docker-compose.founder-tunnel.yml instead.
+services:
+  coord:
+    image: mediapool:latest
+    entrypoint: ["mp-coord"]
+    restart: unless-stopped
+    ports: ["7000:7000"]
+    volumes:
+      - ./coord:/data
+      - ./pool.json:/config/pool.json:ro
+    environment:
+      MP_LISTEN: ":7000"
+      MP_POOL: /config/pool.json
+      MP_KEY: /data/coord.key
+      MP_CATALOG: /data/catalog.log
+      MP_SCORES: /data/scores.json
+      MP_FRESH: "true" # creates the pool on first start; safe afterwards
+
+  node:
+    image: mediapool:latest
+    restart: unless-stopped
+    depends_on: [coord]
+    ports:
+      - "7100:7100"
+      - "127.0.0.1:5572:5572" # web UI, this machine only
+    volumes:
+      - ./node:/data
+      - ./pool.json:/config/pool.json:ro
+    environment:
+      MP_ID: ${NODE_ID}
+      MP_COORD: http://coord:7000 # same machine: talk to it directly
+      MP_RELAY_PUBLIC: ${POOL_URL}
+      MP_REACH: auto
+      MP_QUOTA: 1T
+      MP_UPLOAD_LIMIT: "0"
+      MP_RC_ADDR: 0.0.0.0:5572
+      MP_RC_USER: admin
+      MP_RC_PASS: ${RC_PASS}

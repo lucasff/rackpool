@@ -1,0 +1,80 @@
+# Founder behind a Cloudflare Tunnel: no ports open on your router and your
+# IP address hidden from members. Written by `mp pool init --tunnel`, which
+# also writes .env next to it.
+#
+# Setup (once):
+#   1. Cloudflare dashboard → Zero Trust → Networks → Tunnels → Create a
+#      tunnel (type "cloudflared"). Copy its token into TUNNEL_TOKEN in .env.
+#   2. In the tunnel, add a public hostname: POOL_HOSTNAME (e.g.
+#      pool.example.com) → service http://coord:7000
+#   3. docker compose up -d
+#
+# How it works: cloudflared dials out to Cloudflare and carries requests for
+# POOL_HOSTNAME to the coordinator over that connection, so nothing listens
+# on the internet here. Your node uses the coordinator's relay: other members
+# reach it at https://POOL_HOSTNAME/relay/<node>, never at your IP. Members
+# who also want to hide their IP set MP_REACH=relay on their nodes.
+#
+# What it hides and what it doesn't:
+#   - Members, and anyone scanning, see Cloudflare's addresses, not yours.
+#   - Cloudflare sees your IP and every request: shard ciphertext, sizes,
+#     timing, member public keys. It can't see file names or contents, which
+#     are encrypted before they leave members' machines. Cloudflare answers
+#     legal process like any provider. This is IP privacy from peers, not
+#     anonymity from Cloudflare.
+#   - All relayed traffic crosses your connection and Cloudflare's network.
+#     Check Cloudflare's terms for your plan: they restrict serving large
+#     amounts of video through the free tiers, and accounts doing so can be
+#     suspended.
+services:
+  coord:
+    image: mediapool:latest
+    entrypoint: ["mp-coord"]
+    restart: unless-stopped
+    # No ports: only cloudflared (on the compose network) reaches it.
+    volumes:
+      - ./coord:/data
+      - ./pool.json:/config/pool.json:ro
+    environment:
+      MP_LISTEN: ":7000"
+      MP_POOL: /config/pool.json
+      MP_KEY: /data/coord.key
+      MP_CATALOG: /data/catalog.log
+      MP_SCORES: /data/scores.json
+      MP_FRESH: "true" # creates the pool on first start; safe afterwards
+      MP_RELAY_LIMIT: ${RELAY_LIMIT:-0} # cap per relayed node, e.g. 50M
+
+  node:
+    image: mediapool:latest
+    restart: unless-stopped
+    depends_on: [coord]
+    ports:
+      - "127.0.0.1:5572:5572" # web UI, this machine only
+    volumes:
+      - ./node:/data
+      - ./pool.json:/config/pool.json:ro
+    environment:
+      MP_ID: ${NODE_ID}
+      MP_COORD: http://coord:7000 # same machine: skip the round trip through Cloudflare
+      MP_REACH: relay # never advertise this machine's address
+      MP_PORT_MAP: "false" # never touch the router
+      MP_RELAY: http://coord:7000
+      MP_RELAY_PUBLIC: https://${POOL_HOSTNAME}
+      MP_QUOTA: 1T
+      MP_UPLOAD_LIMIT: "0"
+      MP_RC_ADDR: 0.0.0.0:5572
+      MP_RC_USER: admin
+      MP_RC_PASS: ${RC_PASS}
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.9.2
+    restart: unless-stopped
+    depends_on: [coord]
+    command: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env (Cloudflare dashboard → your tunnel)}
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "127.0.0.1:2000", "ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s

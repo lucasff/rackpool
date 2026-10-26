@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"mediapool/deploy"
 	"mediapool/internal/auth"
 	"mediapool/internal/catalog"
 	"mediapool/internal/invite"
@@ -35,7 +37,7 @@ func identity() (*auth.Identity, error) {
 
 func writeEnv(path string, kv [][2]string) error {
 	var b strings.Builder
-	b.WriteString("# mediapool settings. Keep this file private: it holds the pool secret.\n")
+	b.WriteString("# mediapool settings. Keep this file private.\n")
 	for _, p := range kv {
 		fmt.Fprintf(&b, "%s=%s\n", p[0], p[1])
 	}
@@ -45,6 +47,7 @@ func writeEnv(path string, kv [][2]string) error {
 func poolCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "pool", Short: "Create a pool"}
 	var dir, name, coordURL string
+	var tunnel bool
 	initCmd := &cobra.Command{
 		Use:   "init",
 		Short: "Create a new pool: keys, secret, pool.json and a Docker Compose file for the founder",
@@ -98,8 +101,27 @@ func poolCmd() *cobra.Command {
 			}); err != nil {
 				return err
 			}
-			compose := strings.NewReplacer("{{NODE_ID}}", nodeID, "{{COORD_URL}}", coordURL).Replace(founderCompose)
+			u, err := url.Parse(coordURL)
+			if err != nil || u.Host == "" {
+				return fmt.Errorf("--coord-url %q isn't a URL", coordURL)
+			}
+			compose, reach := deploy.Founder, "Forward TCP 7000 and 7100 to this machine (or use --tunnel)"
+			rcPass := make([]byte, 12)
+			if _, err := rand.Read(rcPass); err != nil {
+				return err
+			}
+			envVars := [][2]string{{"NODE_ID", nodeID}, {"POOL_URL", coordURL}, {"RC_PASS", base64.RawURLEncoding.EncodeToString(rcPass)}}
+			if tunnel {
+				if u.Scheme != "https" {
+					return errors.New("with --tunnel, --coord-url is your tunnel's public hostname: https://pool.example.com")
+				}
+				compose, reach = deploy.FounderTunnel, "Create a Cloudflare Tunnel routing "+u.Host+" → http://coord:7000 and put its token in .env"
+				envVars = append(envVars, [2]string{"POOL_HOSTNAME", u.Host}, [2]string{"TUNNEL_TOKEN", ""}, [2]string{"RELAY_LIMIT", "0"})
+			}
 			if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0o644); err != nil {
+				return err
+			}
+			if err := writeEnv(filepath.Join(dir, ".env"), envVars); err != nil {
 				return err
 			}
 			fmt.Printf(`Created pool in %s
@@ -107,65 +129,26 @@ func poolCmd() *cobra.Command {
   pool.json            public keys: coordinator, you (%s, admin), your node (%s)
   mediapool.env        your settings, including the pool secret: keep it private
   coord/ node/ member/ private keys
-  docker-compose.yml   coordinator + your storage node
+  docker-compose.yml   coordinator + your storage node (.env holds its settings)
 
 Next:
-  1. Make %s reachable from the internet (forward TCP 7000 to this machine,
-     or run the coordinator on a small VPS / behind a tunnel if you're behind CGNAT).
+  1. %s.
   2. cd %s && docker compose up -d
-     (edit MP_QUOTA / MP_UPLOAD_LIMIT and the /media mount in docker-compose.yml first)
+     (adjust MP_QUOTA / MP_UPLOAD_LIMIT in docker-compose.yml first)
   3. Invite people:  set -a; . %s/mediapool.env; set +a
                      mp invite create --name bob
-`, dir, name, nodeID, coordURL, dir, dir)
+`, dir, name, nodeID, reach, dir, dir)
 			return nil
 		},
 	}
 	initCmd.Flags().StringVar(&dir, "dir", "mediapool", "directory to create the pool in")
 	initCmd.Flags().StringVar(&name, "name", "", "your member name")
-	initCmd.Flags().StringVar(&coordURL, "coord-url", "", "public URL of your coordinator, e.g. http://you.duckdns.org:7000")
+	initCmd.Flags().StringVar(&coordURL, "coord-url", "", "public URL of your coordinator, e.g. http://you.duckdns.org:7000, or https://pool.example.com with --tunnel")
+	initCmd.Flags().BoolVar(&tunnel, "tunnel", false, "expose the coordinator through a Cloudflare Tunnel: no open ports, your IP hidden from members")
 	_ = initCmd.MarkFlagRequired("name")
 	cmd.AddCommand(initCmd)
 	return cmd
 }
-
-const founderCompose = `# Founder: the pool's coordinator and your storage node.
-# Shares MEDIAPOOL_SECRET etc. from mediapool.env next to this file.
-services:
-  coord:
-    image: mediapool:latest
-    entrypoint: ["mp-coord"]
-    restart: unless-stopped
-    ports: ["7000:7000"]
-    volumes:
-      - ./coord:/data
-      - ./pool.json:/config/pool.json:ro
-    environment:
-      MP_LISTEN: ":7000"
-      MP_POOL: /config/pool.json
-      MP_KEY: /data/coord.key
-      MP_CATALOG: /data/catalog.log
-      MP_SCORES: /data/scores.json
-      MP_FRESH: "true"   # creates the pool on first start; safe afterwards
-
-  node:
-    image: mediapool:latest
-    restart: unless-stopped
-    depends_on: [coord]
-    ports: ["7100:7100"]
-    volumes:
-      - ./node:/data
-      - ./pool.json:/config/pool.json:ro
-    environment:
-      MP_ID: {{NODE_ID}}
-      MP_COORD: http://coord:7000   # same machine: talk to it directly
-      MP_RELAY: {{COORD_URL}}
-      MP_REACH: auto
-      MP_QUOTA: 1T
-      MP_UPLOAD_LIMIT: "0"
-      MP_RC_ADDR: 0.0.0.0:5572
-      MP_RC_USER: admin
-      MP_RC_PASS: change-me
-`
 
 func inviteCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "invite", Short: "Invite people to the pool (admins)"}

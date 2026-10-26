@@ -42,9 +42,10 @@ func main() {
 	flag.StringVar(&cfg.ID, "id", "", "node id, as registered in the pool file")
 	flag.StringVar(&cfg.Addr, "addr", "", "URL other members reach this node at, if you've set one up (port forward, DNS name, reverse proxy); checked by dial-back")
 	var ro node.ReachOptions
-	flag.StringVar(&ro.Mode, "reach", "auto", "how to be reachable: auto (direct if it works, else relay), direct, relay, or off (advertise -addr unchecked)")
+	flag.StringVar(&ro.Mode, "reach", "auto", "how to be reachable: auto (direct if it works, else relay), direct, relay, announce (only -addr, e.g. your own tunnel: no STUN or port mapping), or off (advertise -addr unchecked)")
 	flag.BoolVar(&ro.PortMap, "port-map", true, "ask the router to forward the port automatically (UPnP/NAT-PMP; in Docker this needs host networking)")
 	flag.StringVar(&ro.RelayURL, "relay", "", "relay to use when not directly reachable (default: the coordinator)")
+	flag.StringVar(&ro.RelayPublicURL, "relay-public", "", "the relay's address as other members reach it, if different from -relay")
 	flag.StringVar(&cfg.DataDir, "data", "", "shard directory")
 	flag.StringVar(&cfg.CoordURL, "coord", "", "coordinator URL (default: from the invite, else http://127.0.0.1:7000)")
 	inviteStr := flag.String("invite", "", "join the pool with this invite on first start (from `mp invite create`)")

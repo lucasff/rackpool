@@ -35,6 +35,17 @@ services:
       MP_ADDR: ""        # e.g. http://my-host.example:7100 if you forwarded the port
       MP_PORT_MAP: "true"
       MP_RELAY: ""       # default: the coordinator
+      #
+      # To keep your IP address hidden from other members, pick one:
+      #   - Relay only: MP_REACH=relay, MP_PORT_MAP=false, and remove `ports:`.
+      #     Nothing listens here; other members reach you through the pool's
+      #     relay. Slower, and you depend on the relay.
+      #   - Your own Cloudflare Tunnel to this node: MP_REACH=announce,
+      #     MP_ADDR=https://node.example.com, MP_PORT_MAP=false, remove
+      #     `ports:`, and add a cloudflared service routing that hostname to
+      #     http://node:7100 (see docker-compose.founder-tunnel.yml).
+      #     "announce" skips STUN and port mapping, so the coordinator never
+      #     learns your IP either.
 
       MP_QUOTA: 2T            # most disk to give the pool (0 = all free space above the reserve)
       MP_RESERVE: 50G         # always leave this much free
