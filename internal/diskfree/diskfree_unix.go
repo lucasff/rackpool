@@ -1,3 +1,5 @@
+//go:build !windows
+
 // Package diskfree reports free space on the filesystem holding a path.
 package diskfree
 

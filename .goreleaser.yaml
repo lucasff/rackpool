@@ -28,9 +28,7 @@ builds:
     main: ./cmd/mp-node
     binary: mp-node
     env: [CGO_ENABLED=0]
-    # internal/diskfree uses golang.org/x/sys/unix (Statfs), which has no
-    # Windows implementation, so mp-node is not built for Windows.
-    goos: [linux, darwin]
+    goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
     flags: [-trimpath]
     ldflags: ["-s -w"]
@@ -39,8 +37,6 @@ archives:
   - id: default
     ids: [mp, mp-coord, mp-node]
     formats: [tar.gz]
-    # mp-node has no Windows build, so Windows archives hold two binaries.
-    allow_different_binary_count: true
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
