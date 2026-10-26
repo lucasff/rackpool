@@ -26,6 +26,30 @@ type NodeInfo struct {
 	ID       string   `json:"id"`
 	Addr     string   `json:"addr"` // base URL of the node's shard API
 	Capacity Capacity `json:"capacity"`
+	// Reach is how Addr was established: "direct" (dial-back confirmed),
+	// "mapped" (router port mapping, dial-back confirmed), "relay" (behind
+	// CGNAT or unreachable; traffic goes through a relay), or "" (unchecked).
+	Reach string `json:"reach,omitempty"`
+}
+
+// ProbeRequest asks the coordinator to dial candidate addresses back.
+type ProbeRequest struct {
+	Candidates []string `json:"candidates"`
+}
+
+type ProbeResponse struct {
+	Reachable []string          `json:"reachable"`
+	Errors    map[string]string `json:"errors,omitempty"`
+}
+
+// PingResponse proves the node at an address holds a given key.
+type PingResponse struct {
+	ID  string `json:"id"`
+	Sig []byte `json:"sig"`
+}
+
+func PingSigMessage(nodeID, nonce string) []byte {
+	return []byte("mediapool/ping/v1\n" + nodeID + "\n" + nonce)
 }
 
 // Capacity is what an operator offers the pool, reported every heartbeat.
@@ -205,6 +229,7 @@ type NodeStatus struct {
 	Strikes  int       `json:"strikes"`
 	FailProb float64   `json:"fail_prob"`
 	Capacity Capacity  `json:"capacity"`
+	Reach    string    `json:"reach,omitempty"`
 	LastSeen time.Time `json:"last_seen"`
 }
 

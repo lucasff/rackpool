@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"mediapool/internal/coord"
 	"mediapool/internal/node"
 	"mediapool/internal/proto"
+	"mediapool/internal/relay"
 	"mediapool/internal/reliability"
 )
 
@@ -35,6 +38,8 @@ type cluster struct {
 	coord    *coord.Coordinator
 	url      string
 	nodes    []*node.Node
+	direct   map[*node.Node]*deferredHandler
+	relay    *relay.Server
 	paused   map[*node.Node]bool
 	mirror   *bridge.Mirror
 	members  map[string]ed25519.PrivateKey
@@ -50,7 +55,7 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	c := &cluster{
-		t: t, ctx: ctx, coordKey: auth.Generate(), paused: map[*node.Node]bool{},
+		t: t, ctx: ctx, coordKey: auth.Generate(), paused: map[*node.Node]bool{}, direct: map[*node.Node]*deferredHandler{},
 		mirror: &bridge.Mirror{Dir: t.TempDir()}, members: map[string]ed25519.PrivateKey{},
 	}
 	c.pool = &auth.Pool{Coordinator: auth.PubHex(c.coordKey)}
@@ -125,6 +130,7 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 		}
 		t.Cleanup(func() { nd.Close() })
 		p.h.h = nd.Handler()
+		c.direct[nd] = p.h
 		c.nodes = append(c.nodes, nd)
 	}
 	c.client = c.newClient("alice")
@@ -139,7 +145,12 @@ func (c *cluster) startCoord(cfg coord.Config) {
 		c.t.Fatal(err)
 	}
 	c.t.Cleanup(func() { co.Close() })
-	srv := httptest.NewServer(co.Handler())
+	c.relay = &relay.Server{Pool: cfg.Pool, Logf: c.t.Logf}
+	mux := http.NewServeMux()
+	mux.Handle("/v1/relay/", c.relay)
+	mux.Handle("/relay/", c.relay)
+	mux.Handle("/", co.Handler())
+	srv := httptest.NewServer(mux)
 	c.t.Cleanup(srv.Close)
 	c.coord, c.url = co, srv.URL
 	for _, n := range c.nodes {
@@ -159,9 +170,20 @@ func (c *cluster) newClient(member string) *client.Client {
 }
 
 // deferredHandler lets a node learn its own server URL before it exists.
-type deferredHandler struct{ h http.Handler }
+// Setting blocked makes the node's direct address refuse everything, as if
+// it sat behind CGNAT.
+type deferredHandler struct {
+	h       http.Handler
+	blocked atomic.Bool
+}
 
-func (d *deferredHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) { d.h.ServeHTTP(w, r) }
+func (d *deferredHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if d.blocked.Load() {
+		http.Error(w, "unreachable", http.StatusServiceUnavailable)
+		return
+	}
+	d.h.ServeHTTP(w, r)
+}
 
 func (c *cluster) heartbeat() {
 	for _, n := range c.nodes {
@@ -897,4 +919,87 @@ func TestPartialRepairIsToppedUp(t *testing.T) {
 	c.settle("back at the floor", 10*time.Second, func(s proto.SegmentStatus) bool {
 		return s.Durable == 9 && s.Online == 9 && !s.Repairing
 	})
+}
+
+// --- reachability -------------------------------------------------------
+
+func noSTUN() []string { return []string{"127.0.0.1:9"} } // fails fast, never leaves the machine
+
+// Nodes whose direct address can't be reached fall back to the relay, and
+// the pool keeps working through them; a reachable node is confirmed
+// direct by the coordinator's dial-back.
+func TestUnreachableNodesUseRelay(t *testing.T) {
+	c := newCluster(t, 12, nil)
+	ctx, cancel := context.WithCancel(c.ctx)
+	defer cancel()
+	var relayed []*node.Node
+	for i, n := range c.nodes {
+		addr, _ := n.Addr()
+		// 9 of 12 relayed: each segment's 9 shards then keep at least 6 (> k)
+		// on relayed nodes, so the reads below must go through the relay.
+		if i < 9 && !n.IsBridge() {
+			c.direct[n].blocked.Store(true) // behind CGNAT: nothing gets in
+			relayed = append(relayed, n)
+		}
+		go n.RunReachability(ctx, node.ReachOptions{Mode: "auto", Announce: addr, STUN: noSTUN(), RelayURL: c.url})
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ok := true
+		for _, n := range c.nodes {
+			r := n.Reach()
+			want := "direct"
+			if slices.Contains(relayed, n) {
+				want = "relay"
+			}
+			if r.Reach != want || (want == "relay" && !r.RelayUp) {
+				ok = false
+			}
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			for _, n := range c.nodes {
+				t.Logf("%s: %+v", n.ID(), n.Reach())
+			}
+			t.Fatal("nodes didn't settle on direct/relay")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := len(c.relay.Connected()); got != len(relayed) {
+		t.Fatalf("%d nodes tunnelled, want %d", got, len(relayed))
+	}
+	t.Logf("relay suggestion for a CGNAT node: %q", relayed[0].Reach().Suggestion)
+
+	c.heartbeat() // advertise the new addresses
+	data := randomFile(t, 200<<10)
+	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/x", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.cycle(3) // storage proofs reach relayed nodes through the tunnel too
+	viaRelay := 0
+	for _, n := range relayed {
+		if inv, _ := n.Inventory(); len(inv) > 0 {
+			viaRelay++
+		}
+	}
+	if viaRelay == 0 {
+		t.Fatal("no shards landed on relayed nodes; the test proves nothing")
+	}
+	// Force reads through relayed nodes: take the direct ones offline.
+	for _, n := range c.nodes {
+		if !slices.Contains(relayed, n) {
+			c.pause(n)
+		}
+	}
+	got := c.readBack(c.client, "/x")
+	if !bytes.Equal(got, data) {
+		t.Fatal("data mismatch through relay")
+	}
+	for _, s := range c.coord.Status().Nodes {
+		if s.Strikes != 0 {
+			t.Errorf("node %s got strikes over the relay", s.ID)
+		}
+	}
 }

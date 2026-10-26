@@ -37,10 +37,13 @@ mkdir -p "$W/swarm/abc123"
 head -c 30000000 /dev/urandom >"$W/swarm/abc123/Show.S01E01.mkv"
 
 for i in $(seq 1 13); do
-  bin/mp-node -pool "$W/pool.json" -id "node$i" -listen ":$((7100 + i))" -data "$W/n$i" -heartbeat 1s 2>>"$W/nodes.log" &
+  # node13 pretends to be behind CGNAT: it only reaches out, through the relay.
+  reach=(-reach off -addr "http://127.0.0.1:$((7100 + i))")
+  [ "$i" = 13 ] && reach=(-reach relay)
+  bin/mp-node -pool "$W/pool.json" -id "node$i" -listen ":$((7100 + i))" "${reach[@]}" -data "$W/n$i" -heartbeat 1s 2>>"$W/nodes.log" &
   pids+=($!)
 done
-bin/mp-node -pool "$W/pool.json" -id bridge -listen ":7199" -data "$W/n14" -heartbeat 1s -bridge-mirror "$W/swarm" 2>>"$W/nodes.log" &
+bin/mp-node -pool "$W/pool.json" -id bridge -listen ":7199" -reach off -addr http://127.0.0.1:7199 -data "$W/n14" -heartbeat 1s -bridge-mirror "$W/swarm" 2>>"$W/nodes.log" &
 pids+=($!)
 sleep 2
 
@@ -82,6 +85,9 @@ mp bob rm /bob/show-1x01.mkv
 sleep 6
 echo "shard files left on disk: $(find "$W"/n* -path '*shards*' -type f ! -name '*.proof' | wc -l | tr -d ' ')"
 
+echo
+echo "== relayed node"
+grep -E "node13.*(using relay)|relay: node node13 connected" "$W/nodes.log" "$W/coord.log" | sed -E 's/^.*[0-9]{2}:[0-9]{2}:[0-9]{2} //' | sort -u
 echo
 echo "== coordinator log highlights"
 grep -E "rebuilding|swarm (healthy|dead)|shrank|recovered|collected|forked|failed storage" "$W/coord.log" | sed -E 's/^[0-9\/: ]+//; s/ \(t[0-9]+\)$//' | sort | uniq -c | sort -rn

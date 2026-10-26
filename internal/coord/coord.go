@@ -27,6 +27,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -168,6 +169,7 @@ type node struct {
 	entry    auth.NodeEntry
 	addr     string
 	cap      proto.Capacity
+	reach    string
 	pledged  int64 // bytes of tickets issued this heartbeat, not yet reflected in cap.Free
 	lastSeen time.Time
 	head     catalog.Head
@@ -282,6 +284,7 @@ func (c *Coordinator) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/heartbeat", c.nodeOnly(c.handleHeartbeat))
 	mux.HandleFunc("POST /v1/task-result", c.nodeOnly(c.handleTaskResult))
 	mux.HandleFunc("POST /v1/swarm-report", c.nodeOnly(c.handleSwarmReport))
+	mux.HandleFunc("POST /v1/probe", c.nodeOnly(c.handleProbe))
 	mux.HandleFunc("POST /v1/prepare", c.memberOnly(c.handlePrepare))
 	mux.HandleFunc("POST /v1/commit", c.memberOnly(c.handleCommit))
 	mux.HandleFunc("POST /v1/files", c.memberOnly(c.handleFilePut))
@@ -520,6 +523,9 @@ func fill(n *node) float64 {
 }
 
 func upRank(n *node) int64 {
+	if n.reach == "relay" {
+		return 1 // every byte crosses the relay: last choice for hot data
+	}
 	if n.cap.UploadBps == 0 {
 		return math.MaxInt64
 	}
@@ -1131,7 +1137,7 @@ func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, _ *http.Request, p 
 	}
 	c.cfg.Reliability.Heartbeat(c.score(p.Node.Owner), n.lastSeen, now)
 	n.entry, n.addr, n.lastSeen, n.head = *p.Node, req.Node.Addr, now, req.Head
-	n.cap, n.pledged = req.Node.Capacity, 0
+	n.cap, n.pledged, n.reach = req.Node.Capacity, 0, req.Node.Reach
 
 	// Reconcile the inventory. Shards no longer reported are gone. New ones
 	// start unverified and count only after a storage proof, so a node can't
@@ -1257,6 +1263,54 @@ func (c *Coordinator) handleSwarmReport(w http.ResponseWriter, _ *http.Request, 
 	}
 	c.info(s.ID).swarmChecked = time.Now()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleProbe dials a node's candidate addresses back and reports which
+// ones reach it. Each candidate must answer a fresh nonce with a signature
+// from the node's own key, so an address that leads to some other machine
+// doesn't count.
+func (c *Coordinator) handleProbe(w http.ResponseWriter, r *http.Request, p auth.Principal, body []byte) {
+	var req proto.ProbeRequest
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Candidates) > 8 {
+		http.Error(w, "bad probe request", http.StatusBadRequest)
+		return
+	}
+	pub, _ := hex.DecodeString(p.Node.Key)
+	hc := &http.Client{Timeout: 4 * time.Second}
+	resp := proto.ProbeResponse{Reachable: []string{}, Errors: map[string]string{}}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, cand := range req.Candidates {
+		u, err := url.Parse(cand)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			resp.Errors[cand] = "not an http(s) URL"
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			b := make([]byte, 16)
+			_, _ = rand.Read(b)
+			nonce := hex.EncodeToString(b)
+			var pr proto.PingResponse
+			err := transfer.GetJSON(r.Context(), hc, nil, strings.TrimRight(cand, "/")+"/v1/ping?nonce="+nonce, &pr)
+			if err == nil && (pr.ID != p.Node.ID || !ed25519.Verify(pub, proto.PingSigMessage(p.Node.ID, nonce), pr.Sig)) {
+				err = errors.New("answered, but not by this node")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				resp.Errors[cand] = err.Error()
+			} else {
+				resp.Reachable = append(resp.Reachable, cand)
+			}
+		}()
+	}
+	wg.Wait()
+	slices.SortFunc(resp.Reachable, func(a, b string) int {
+		return cmp.Compare(slices.Index(req.Candidates, a), slices.Index(req.Candidates, b))
+	})
+	writeJSON(w, resp)
 }
 
 // --- member handlers ------------------------------------------------------
@@ -1472,7 +1526,7 @@ func (c *Coordinator) Status() proto.StatusResponse {
 		out.Nodes = append(out.Nodes, proto.NodeStatus{
 			ID: n.entry.ID, Owner: n.entry.Owner, Addr: n.addr, Bridge: n.entry.Bridge,
 			Online: c.online(n, now), Shards: len(n.shards), Strikes: n.strikes, LastSeen: n.lastSeen,
-			FailProb: c.failProb(n), Capacity: n.cap,
+			FailProb: c.failProb(n), Capacity: n.cap, Reach: n.reach,
 		})
 	}
 	for _, s := range c.cat.LiveSegments() {

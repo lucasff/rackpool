@@ -32,7 +32,11 @@ func main() {
 	poolPath := flag.String("pool", "pool.json", "pool membership file")
 	keyPath := flag.String("key", "", "node private key (default <data>/node.key, created if missing)")
 	flag.StringVar(&cfg.ID, "id", "", "node id, as registered in the pool file")
-	flag.StringVar(&cfg.Addr, "addr", "", "public URL other nodes reach this node at (default http://127.0.0.1<listen>)")
+	flag.StringVar(&cfg.Addr, "addr", "", "URL other members reach this node at, if you've set one up (port forward, DNS name, reverse proxy); checked by dial-back")
+	var ro node.ReachOptions
+	flag.StringVar(&ro.Mode, "reach", "auto", "how to be reachable: auto (direct if it works, else relay), direct, relay, or off (advertise -addr unchecked)")
+	flag.BoolVar(&ro.PortMap, "port-map", true, "ask the router to forward the port automatically (UPnP/NAT-PMP; in Docker this needs host networking)")
+	flag.StringVar(&ro.RelayURL, "relay", "", "relay to use when not directly reachable (default: the coordinator)")
 	flag.StringVar(&cfg.DataDir, "data", "", "shard directory")
 	flag.StringVar(&cfg.CoordURL, "coord", "http://127.0.0.1:7000", "coordinator URL")
 	flag.DurationVar(&cfg.Heartbeat, "heartbeat", 15*time.Second, "heartbeat interval")
@@ -68,8 +72,12 @@ func main() {
 		return
 	}
 	cfg.Key = key
+	ro.Announce, ro.ListenPort = cfg.Addr, node.PortOf(*listen)
+	if ro.RelayURL == "" {
+		ro.RelayURL = cfg.CoordURL
+	}
 	if cfg.Addr == "" {
-		cfg.Addr = "http://127.0.0.1" + *listen
+		cfg.Addr = "http://127.0.0.1" + *listen // placeholder until reachability is established
 	}
 	if cfg.Pool, err = auth.LoadPool(*poolPath); err != nil {
 		log.Fatal(err)
@@ -86,6 +94,7 @@ func main() {
 	defer n.Close()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go n.RunReachability(ctx, ro)
 	go n.Run(ctx)
 	mux := http.NewServeMux()
 	mux.Handle("/v1/", n.Handler())

@@ -35,6 +35,7 @@ import (
 	"mediapool/internal/diskfree"
 	"mediapool/internal/limits"
 	"mediapool/internal/proto"
+	"mediapool/internal/relay"
 	"mediapool/internal/transfer"
 )
 
@@ -82,11 +83,14 @@ type Node struct {
 
 	up, down *limits.Bucket
 	slots    chan struct{}
+	rs       reachState
 
 	mu       sync.Mutex
 	paused   bool // test hook: simulate the node going dark
 	coordURL string
 	drain    bool
+	addr     string
+	reach    string
 	quota    int64
 	used     int64 // bytes of shards on disk, kept current on write/delete
 }
@@ -130,7 +134,7 @@ func New(cfg Config) (*Node, error) {
 	n := &Node{
 		cfg: cfg, id: auth.NewIdentity(cfg.Key), coord: coord, cat: cat, coordURL: cfg.CoordURL,
 		up: up, down: down, slots: make(chan struct{}, cfg.MaxTransfers),
-		drain: cfg.Drain, quota: cfg.Quota,
+		drain: cfg.Drain, quota: cfg.Quota, addr: cfg.Addr,
 	}
 	if n.used, err = n.diskUsage(); err != nil {
 		return nil, err
@@ -162,6 +166,11 @@ func (n *Node) diskUsage() (int64, error) {
 		return nil
 	})
 	return total, err
+}
+
+func (n *Node) info() proto.NodeInfo {
+	addr, reach := n.Addr()
+	return proto.NodeInfo{ID: n.cfg.ID, Addr: addr, Reach: reach, Capacity: n.Capacity()}
 }
 
 // Capacity reports what this node offers the pool right now.
@@ -243,6 +252,20 @@ func (n *Node) SetCoordURL(u string) {
 	n.mu.Lock()
 	n.coordURL = u
 	n.mu.Unlock()
+}
+
+// SetAddr changes the address the node advertises, and how it was
+// established (see proto.NodeInfo.Reach).
+func (n *Node) SetAddr(addr, reach string) {
+	n.mu.Lock()
+	n.addr, n.reach = addr, reach
+	n.mu.Unlock()
+}
+
+func (n *Node) Addr() (addr, reach string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.addr, n.reach
 }
 
 func (n *Node) coordBase() string {
@@ -335,6 +358,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/shards/{seg}/{idx}", n.handleGet)
 	mux.HandleFunc("PUT /v1/shards/{seg}/{idx}", n.handlePut)
 	mux.HandleFunc("GET /v1/proof/{seg}/{idx}", n.handleProof)
+	mux.HandleFunc("GET /v1/ping", n.handlePing)
 	mux.HandleFunc("GET /v1/log", n.authed(n.cat.ServeLog))
 	return mux
 }
@@ -346,7 +370,7 @@ func (n *Node) authed(h http.HandlerFunc) http.HandlerFunc {
 			http.Error(w, "offline", http.StatusServiceUnavailable)
 			return
 		}
-		pub, err := n.reqAuth.Verify(r, nil)
+		pub, err := n.reqAuth.VerifyURI(r, signedURI(r), nil)
 		if err == nil {
 			if _, ok := n.cfg.Pool.Lookup(pub); !ok && !pub.Equal(n.coord) {
 				err = errors.New("not a pool participant")
@@ -358,6 +382,28 @@ func (n *Node) authed(h http.HandlerFunc) http.HandlerFunc {
 		}
 		h(w, r)
 	}
+}
+
+// signedURI is the URI the sender signed. Behind a relay that's the
+// relay's longer URI, which must end with the path the node received.
+func signedURI(r *http.Request) string {
+	uri := r.URL.RequestURI()
+	if orig := r.Header.Get(relay.OriginalURIHeader); orig != "" && strings.HasSuffix(orig, uri) {
+		return orig
+	}
+	return uri
+}
+
+// handlePing answers the coordinator's reachability probe, proving this
+// address really leads to this node.
+func (n *Node) handlePing(w http.ResponseWriter, r *http.Request) {
+	nonce := r.URL.Query().Get("nonce")
+	if len(nonce) < 16 || len(nonce) > 128 || n.isPaused() {
+		http.Error(w, "bad ping", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(proto.PingResponse{ID: n.cfg.ID, Sig: ed25519.Sign(n.cfg.Key, proto.PingSigMessage(n.cfg.ID, nonce))})
 }
 
 func parseKey(r *http.Request, rootHex string) (proto.ShardKey, error) {
@@ -489,8 +535,7 @@ func (n *Node) handleProof(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "offline", http.StatusServiceUnavailable)
 		return
 	}
-	body := []byte(nil)
-	pub, err := n.reqAuth.Verify(r, body)
+	pub, err := n.reqAuth.VerifyURI(r, signedURI(r), nil)
 	if err != nil || !pub.Equal(n.coord) {
 		http.Error(w, "only the coordinator issues challenges", http.StatusUnauthorized)
 		return
@@ -556,7 +601,7 @@ func (n *Node) HeartbeatOnce(ctx context.Context) error {
 		return err
 	}
 	req := proto.HeartbeatRequest{
-		Node:      proto.NodeInfo{ID: n.cfg.ID, Addr: n.cfg.Addr, Capacity: n.Capacity()},
+		Node:      n.info(),
 		Head:      n.cat.Head(),
 		Inventory: inv,
 	}

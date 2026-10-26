@@ -15,13 +15,25 @@ services:
     restart: unless-stopped
     ports:
       - "7100:7100"
+    # Automatic port mapping (UPnP/NAT-PMP) can't see the router from a
+    # bridge network. Uncomment to enable it (and drop `ports:`):
+    # network_mode: host
     volumes:
       - ./data:/data              # shards and node.key: put this on the disk you're sharing
       - ./pool.json:/config/pool.json:ro
     environment:
       MP_ID: my-node                       # as registered in pool.json
-      MP_ADDR: http://my-host.example:7100 # how other members reach you
       MP_COORD: http://coordinator.example:7000
+
+      # Reachability. With MP_REACH=auto the node finds its public IP (STUN),
+      # tries the address below and an automatic router port mapping, has the
+      # coordinator dial each back, and uses the first that works. If none do
+      # (e.g. carrier-grade NAT), it tunnels through the relay instead: that
+      # works everywhere but is slower, so forwarding TCP 7100 is better.
+      MP_REACH: auto
+      MP_ADDR: ""        # e.g. http://my-host.example:7100 if you forwarded the port
+      MP_PORT_MAP: "true"
+      MP_RELAY: ""       # default: the coordinator
 
       MP_QUOTA: 2T            # most disk to give the pool (0 = all free space above the reserve)
       MP_RESERVE: 50G         # always leave this much free

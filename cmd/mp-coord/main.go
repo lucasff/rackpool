@@ -11,6 +11,8 @@ import (
 	"mediapool/internal/auth"
 	"mediapool/internal/coord"
 	"mediapool/internal/envflag"
+	"mediapool/internal/limits"
+	"mediapool/internal/relay"
 )
 
 func main() {
@@ -35,6 +37,9 @@ func main() {
 	flag.DurationVar(&cfg.SwarmCheckEvery, "swarm-check-every", cfg.SwarmCheckEvery, "how often bridges re-check external swarms")
 	flag.DurationVar(&cfg.GCGrace, "gc-grace", cfg.GCGrace, "how long a segment sits unreferenced before collection")
 	flag.DurationVar(&cfg.TickEvery, "tick", cfg.TickEvery, "scheduler interval")
+	relayOn := flag.Bool("relay", true, "relay traffic for nodes that can't be reached directly (behind CGNAT)")
+	var relayLimit limits.Rate
+	flag.Var(&relayLimit, "relay-limit", "bandwidth cap per relayed node, e.g. 20M for 20 Mbit/s (0 = unlimited)")
 	pubkey := flag.Bool("print-pubkey", false, "print the coordinator's public key (creating the key if needed) and exit")
 	if err := envflag.Parse(flag.CommandLine, os.Args[1:]); err != nil {
 		log.Fatal(err)
@@ -62,6 +67,11 @@ func main() {
 	go c.Run(make(chan struct{}))
 	mux := http.NewServeMux()
 	mux.Handle("/v1/", c.Handler())
+	if *relayOn {
+		rs := &relay.Server{Pool: pool, PerNodeBps: relayLimit.BytesPerSec(), Logf: log.Printf}
+		mux.Handle("/v1/relay/", rs)
+		mux.Handle("/relay/", rs)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { fmt.Fprintln(w, "ok") })
 	log.Printf("coordinator on %s (k=%d anchored=%d orphan=%d max=%d, %d members, %d nodes)",
 		*listen, cfg.Params.K, cfg.AnchoredN, cfg.OrphanN, cfg.Params.MaxN, len(pool.Members), len(pool.Nodes))

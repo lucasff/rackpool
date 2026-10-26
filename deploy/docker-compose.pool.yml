@@ -35,6 +35,7 @@ services:
       MP_ADDR: http://node1:7100
       MP_COORD: http://coord:7000
       MP_HEARTBEAT: 2s
+      MP_REACH: "off"   # everything is on one Docker network here
       MP_RESERVE: "0"
       MP_QUOTA: 500M
       MP_UPLOAD_LIMIT: 400M

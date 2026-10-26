@@ -67,6 +67,12 @@ type Verifier struct {
 }
 
 func (v *Verifier) Verify(r *http.Request, body []byte) (ed25519.PublicKey, error) {
+	return v.VerifyURI(r, r.URL.RequestURI(), body)
+}
+
+// VerifyURI is Verify for a request whose signed URI differs from the one
+// it arrived with (a relay strips its own path prefix).
+func (v *Verifier) VerifyURI(r *http.Request, uri string, body []byte) (ed25519.PublicKey, error) {
 	f := strings.Fields(r.Header.Get("Authorization"))
 	if len(f) != 5 || f[0] != scheme {
 		return nil, fmt.Errorf("%w: missing or malformed Authorization header", ErrUnauthenticated)
@@ -95,7 +101,7 @@ func (v *Verifier) Verify(r *http.Request, body []byte) (ed25519.PublicKey, erro
 	if d := now.Sub(time.UnixMilli(ms)); d > skew || d < -skew {
 		return nil, fmt.Errorf("%w: timestamp outside the %v window", ErrUnauthenticated, skew)
 	}
-	if !ed25519.Verify(pub, message(r.Method, r.URL.RequestURI(), f[2], nonce, body), sig) {
+	if !ed25519.Verify(pub, message(r.Method, uri, f[2], nonce, body), sig) {
 		return nil, fmt.Errorf("%w: bad signature", ErrUnauthenticated)
 	}
 
