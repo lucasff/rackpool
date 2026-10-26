@@ -7,7 +7,13 @@ updates:
     groups:
       go-deps:
         patterns: ["*"]
-  # When the rclone/ module lands, add a gomod entry with `directory: /rclone`.
+  - package-ecosystem: gomod
+    directory: /rclone
+    schedule:
+      interval: weekly
+    groups:
+      rclone-deps:
+        patterns: ["*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:
