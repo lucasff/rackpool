@@ -1,10 +1,11 @@
 # Run one mediapool storage node.
 #
-#   1. Put the pool's pool.json next to this file (your pool admin sends it).
-#   2. Print your node's public key and send it to the admin with your node id:
-#        docker compose -f docker-compose.node.yml run --rm node -print-pubkey
-#   3. Once you're in pool.json, start it:
-#        docker compose -f docker-compose.node.yml up -d
+#   1. Paste the invite a pool admin sent you into MP_INVITE below.
+#   2. docker compose -f docker-compose.node.yml up -d
+#
+# On first start the node joins the pool: it creates your keys in ./data and
+# writes ./data/mediapool.env, which the mp CLI can use (it holds the pool
+# secret: keep ./data private). Leaving MP_INVITE set afterwards is harmless.
 #
 # Change limits by editing the environment and running `up -d` again. Set
 # MP_DRAIN=true to move your shards to other nodes before leaving the pool.
@@ -20,10 +21,10 @@ services:
     # network_mode: host
     volumes:
       - ./data:/data              # shards and node.key: put this on the disk you're sharing
-      - ./pool.json:/config/pool.json:ro
     environment:
-      MP_ID: my-node                       # as registered in pool.json
-      MP_COORD: http://coordinator.example:7000
+      MP_INVITE: "mpool1...."   # from `mp invite create`
+      MP_MEMBER: ""             # your name (default: the one in the invite)
+      MP_ID: ""                 # node name (default: <member>-node)
 
       # Reachability. With MP_REACH=auto the node finds its public IP (STUN),
       # tries the address below and an automatic router port mapping, has the

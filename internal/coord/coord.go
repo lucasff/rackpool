@@ -34,6 +34,7 @@ import (
 	"mediapool/internal/auth"
 	"mediapool/internal/catalog"
 	"mediapool/internal/codec"
+	"mediapool/internal/invite"
 	"mediapool/internal/proto"
 	"mediapool/internal/reliability"
 	"mediapool/internal/transfer"
@@ -237,10 +238,11 @@ func New(cfg Config) (*Coordinator, error) {
 	if cfg.HTTP == nil {
 		cfg.HTTP = &http.Client{Timeout: time.Minute}
 	}
-	cat, err := catalog.Open(cfg.LogPath, cfg.Key.Public().(ed25519.PublicKey), cfg.Pool.MemberKey)
+	cat, err := catalog.Open(cfg.LogPath, cfg.Key.Public().(ed25519.PublicKey))
 	if err != nil {
 		return nil, err
 	}
+	cfg.Pool.Attach(cat)
 	c := &Coordinator{
 		cfg: cfg, cat: cat, id: auth.NewIdentity(cfg.Key),
 		nodes: map[string]*node{}, segs: map[string]*segInfo{}, uploads: map[string]*upload{},
@@ -253,8 +255,23 @@ func New(cfg Config) (*Coordinator, error) {
 	if err := c.loadScores(); err != nil {
 		return nil, err
 	}
+	marker := cfg.LogPath + ".created"
+	if cfg.Fresh && cfg.LogPath != "" && cat.Head().Seq == 0 {
+		if _, err := os.Stat(marker); err == nil {
+			// This coordinator created a pool here before and its catalog
+			// is now empty: the log was lost. Starting fresh would fork the
+			// pool, so recover from the nodes instead.
+			cfg.Logf("coordinator: catalog %s is empty but a pool was created here before; ignoring -fresh and recovering from nodes", cfg.LogPath)
+			cfg.Fresh = false
+		} else if err := os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+			return nil, err
+		}
+	}
 	if cat.Head().Seq > 0 || cfg.Fresh {
 		c.ready = true
+		if err := c.ensureFounders(); err != nil {
+			return nil, err
+		}
 	} else {
 		c.blocked = "catalog is empty and this isn't a fresh pool: waiting to recover it from a node"
 		cfg.Logf("coordinator: %s", c.blocked)
@@ -290,6 +307,15 @@ func (c *Coordinator) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/files", c.memberOnly(c.handleFilePut))
 	mux.HandleFunc("POST /v1/files/delete", c.memberOnly(c.handleFileDel))
 	mux.HandleFunc("GET /v1/locate/{seg}", c.memberOnly(c.handleLocate))
+	mux.HandleFunc("POST /v1/invites", c.memberOnly(c.handleInviteCreate))
+	mux.HandleFunc("POST /v1/join", c.handleJoin) // unauthenticated: the invite code is the credential
+	mux.HandleFunc("POST /v1/nodes", c.memberOnly(c.handleNodeAdd))
+	mux.HandleFunc("POST /v1/nodes/remove", c.memberOnly(c.handleNodeRemove))
+	mux.HandleFunc("POST /v1/nodes/bridge", c.memberOnly(c.handleNodeBridge))
+	mux.HandleFunc("POST /v1/members/remove", c.memberOnly(c.handleMemberRemove))
+	mux.HandleFunc("GET /v1/members", c.anyone(func(w http.ResponseWriter, _ *http.Request, _ auth.Principal, _ []byte) {
+		writeJSON(w, map[string]any{"members": c.cfg.Pool.AllMembers(), "nodes": c.cfg.Pool.AllNodes()})
+	}))
 	mux.HandleFunc("GET /v1/log", c.anyone(func(w http.ResponseWriter, r *http.Request, _ auth.Principal, _ []byte) {
 		c.cat.ServeLog(w, r)
 	}))
@@ -1008,6 +1034,9 @@ func (c *Coordinator) recoverLocked() {
 		}
 	}
 	c.ready, c.blocked = true, ""
+	if err := c.ensureFounders(); err != nil {
+		c.cfg.Logf("coordinator: recording founders: %v", err)
+	}
 	c.cfg.Logf("coordinator: recovered %d catalog entries from %s, head %d", got, id, c.cat.Head().Seq)
 }
 
@@ -1592,4 +1621,200 @@ func (c *Coordinator) saveScores(now time.Time) {
 		return
 	}
 	c.scoresSaved = now
+}
+
+// --- membership -------------------------------------------------------------
+
+// ensureFounders records pool.json's members and nodes in the catalog if
+// they aren't there yet. On a new pool these become the first entries, so
+// every replica knows the founders before any of their files.
+func (c *Coordinator) ensureFounders() error {
+	have := map[string]bool{}
+	for _, m := range c.cat.JoinedMembers() {
+		have["m/"+m.Name] = true
+	}
+	for _, n := range c.cat.JoinedNodes() {
+		have["n/"+n.ID] = true
+	}
+	for _, m := range c.cfg.Pool.Members {
+		if !have["m/"+m.Name] {
+			if _, err := c.appendEntry(catalog.TypeMemberAdd, catalog.MemberAdd{Name: m.Name, Key: m.Key, Admin: m.Admin}); err != nil {
+				return fmt.Errorf("founder %s: %w", m.Name, err)
+			}
+		}
+	}
+	for _, n := range c.cfg.Pool.Nodes {
+		if have["n/"+n.ID] {
+			continue
+		}
+		if _, err := c.appendEntry(catalog.TypeNodeAdd, catalog.NodeAdd{ID: n.ID, Key: n.Key, Owner: n.Owner}); err != nil {
+			return fmt.Errorf("founder node %s: %w", n.ID, err)
+		}
+		if n.Bridge {
+			if _, err := c.appendEntry(catalog.TypeNodeBridge, catalog.NodeBridge{ID: n.ID, Bridge: true}); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Coordinator) isAdmin(name string) bool {
+	m, ok := c.cfg.Pool.Member(name)
+	return ok && m.Admin
+}
+
+// appendMembership logs a membership entry, mapping catalog rule
+// violations to 409 so callers see why.
+func (c *Coordinator) appendMembership(w http.ResponseWriter, typ string, body any) bool {
+	if !c.writable(w) {
+		return false
+	}
+	if _, err := c.appendEntry(typ, body); err != nil {
+		code := http.StatusInternalServerError
+		if errors.Is(err, catalog.ErrInvalid) {
+			code = http.StatusConflict
+		}
+		http.Error(w, err.Error(), code)
+		return false
+	}
+	return true
+}
+
+func (c *Coordinator) handleInviteCreate(w http.ResponseWriter, _ *http.Request, p auth.Principal, body []byte) {
+	var b catalog.InviteCreate
+	if err := json.Unmarshal(body, &b); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !c.isAdmin(p.Member) {
+		http.Error(w, "only admins can invite", http.StatusForbidden)
+		return
+	}
+	b.By = p.Member
+	if b.ExpiresMs == 0 {
+		b.ExpiresMs = time.Now().Add(7 * 24 * time.Hour).UnixMilli()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.appendMembership(w, catalog.TypeInviteCreate, b) {
+		c.cfg.Logf("invite created by %s (for %q, admin=%v)", p.Member, b.Name, b.Admin)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleJoin redeems an invite. The joiner proves it holds the keys it
+// registers by signing the request with each of them.
+func (c *Coordinator) handleJoin(w http.ResponseWriter, r *http.Request) {
+	var req invite.Request
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&req); err != nil {
+		http.Error(w, "bad join request", http.StatusBadRequest)
+		return
+	}
+	check := func(keyHex string, sig []byte) bool {
+		k, err := hex.DecodeString(keyHex)
+		return err == nil && len(k) == ed25519.PublicKeySize && ed25519.Verify(k, req.Message(), sig)
+	}
+	if !check(req.MemberKey, req.MemberSig) || (req.NodeKey != "" && !check(req.NodeKey, req.NodeSig)) {
+		http.Error(w, "join request not signed by the keys it registers", http.StatusBadRequest)
+		return
+	}
+	hash := invite.Hash(req.Code)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	inv, err := c.cat.InviteStatus(hash, time.Now().UnixMilli())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusForbidden)
+		return
+	}
+	// Check the node first so a bad node id doesn't consume the invite.
+	if req.NodeID != "" {
+		if _, taken := c.cfg.Pool.Node(req.NodeID); taken {
+			http.Error(w, fmt.Sprintf("node id %q is taken", req.NodeID), http.StatusConflict)
+			return
+		}
+		if req.NodeKey == req.MemberKey {
+			http.Error(w, "node and member need different keys", http.StatusBadRequest)
+			return
+		}
+	}
+	if !c.appendMembership(w, catalog.TypeMemberAdd, catalog.MemberAdd{Name: req.Member, Key: req.MemberKey, Admin: inv.Admin, Invite: hash}) {
+		return
+	}
+	if req.NodeID != "" && !c.appendMembership(w, catalog.TypeNodeAdd, catalog.NodeAdd{ID: req.NodeID, Key: req.NodeKey, Owner: req.Member}) {
+		return
+	}
+	c.cfg.Logf("%s joined (invited by %s), node %q", req.Member, inv.By, req.NodeID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (c *Coordinator) handleNodeAdd(w http.ResponseWriter, _ *http.Request, p auth.Principal, body []byte) {
+	var req invite.NodeAddRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	k, err := hex.DecodeString(req.Key)
+	if err != nil || len(k) != ed25519.PublicKeySize || !ed25519.Verify(k, invite.NodeAddMessage(req.ID, p.Member, req.Key), req.Sig) {
+		http.Error(w, "node add not signed by the node key", http.StatusBadRequest)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.appendMembership(w, catalog.TypeNodeAdd, catalog.NodeAdd{ID: req.ID, Key: req.Key, Owner: p.Member}) {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (c *Coordinator) handleNodeRemove(w http.ResponseWriter, _ *http.Request, p auth.Principal, body []byte) {
+	var b catalog.NodeRemove
+	if err := json.Unmarshal(body, &b); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	n, ok := c.cfg.Pool.Node(b.ID)
+	if !ok || (n.Owner != p.Member && !c.isAdmin(p.Member)) {
+		http.Error(w, "only the node's owner or an admin can remove it", http.StatusForbidden)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.appendMembership(w, catalog.TypeNodeRemove, b) {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (c *Coordinator) handleNodeBridge(w http.ResponseWriter, _ *http.Request, p auth.Principal, body []byte) {
+	var b catalog.NodeBridge
+	if err := json.Unmarshal(body, &b); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !c.isAdmin(p.Member) {
+		http.Error(w, "only admins grant the bridge role", http.StatusForbidden)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.appendMembership(w, catalog.TypeNodeBridge, b) {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (c *Coordinator) handleMemberRemove(w http.ResponseWriter, _ *http.Request, p auth.Principal, body []byte) {
+	var b catalog.MemberRemove
+	if err := json.Unmarshal(body, &b); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if !c.isAdmin(p.Member) {
+		http.Error(w, "only admins remove members", http.StatusForbidden)
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.appendMembership(w, catalog.TypeMemberRemove, b) {
+		c.cfg.Logf("member %s removed by %s", b.Name, p.Member)
+		w.WriteHeader(http.StatusNoContent)
+	}
 }

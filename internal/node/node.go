@@ -129,10 +129,11 @@ func New(cfg Config) (*Node, error) {
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, "shards"), 0o755); err != nil {
 		return nil, err
 	}
-	cat, err := catalog.Open(filepath.Join(cfg.DataDir, "catalog.log"), coord, cfg.Pool.MemberKey)
+	cat, err := catalog.Open(filepath.Join(cfg.DataDir, "catalog.log"), coord)
 	if err != nil {
 		return nil, err
 	}
+	cfg.Pool.Attach(cat)
 	n := &Node{
 		cfg: cfg, id: auth.NewIdentity(cfg.Key), coord: coord, cat: cat, coordURL: cfg.CoordURL,
 		up: up, down: down, slots: make(chan struct{}, cfg.MaxTransfers),

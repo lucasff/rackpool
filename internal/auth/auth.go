@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,17 +127,80 @@ func (v *Verifier) VerifyURI(r *http.Request, uri string, body []byte) (ed25519.
 	return pub, nil
 }
 
-// Pool is the public membership file every participant shares. It holds
-// public keys only.
+// Pool is the membership a process checks keys against: the bootstrap pool
+// file (the coordinator key and the founders) plus everyone who joined
+// later, read live from the catalog via Attach. It holds public keys only.
 type Pool struct {
 	Coordinator string      `json:"coordinator"`
 	Members     []Member    `json:"members"`
 	Nodes       []NodeEntry `json:"nodes"`
+
+	mu  sync.RWMutex
+	dyn Membership
+}
+
+// Membership is the joined members and nodes, kept by the catalog.
+type Membership interface {
+	JoinedMembers() []Member
+	JoinedNodes() []NodeEntry
+}
+
+// Clone copies the pool file's contents without any attached catalog. Each
+// component that attaches its own catalog replica needs its own Pool.
+func (p *Pool) Clone() *Pool {
+	return &Pool{Coordinator: p.Coordinator, Members: slices.Clone(p.Members), Nodes: slices.Clone(p.Nodes)}
+}
+
+// Attach makes lookups also consult m (a catalog replica).
+func (p *Pool) Attach(m Membership) {
+	p.mu.Lock()
+	p.dyn = m
+	p.mu.Unlock()
+}
+
+func (p *Pool) allMembers() []Member {
+	p.mu.RLock()
+	dyn := p.dyn
+	p.mu.RUnlock()
+	if dyn == nil {
+		return p.Members
+	}
+	return append(slices.Clone(p.Members), dyn.JoinedMembers()...)
+}
+
+func (p *Pool) allNodes() []NodeEntry {
+	p.mu.RLock()
+	dyn := p.dyn
+	p.mu.RUnlock()
+	if dyn == nil {
+		return p.Nodes
+	}
+	return append(slices.Clone(p.Nodes), dyn.JoinedNodes()...)
+}
+
+// AllMembers and AllNodes list founders and joiners together.
+func (p *Pool) AllMembers() []Member  { return p.allMembers() }
+func (p *Pool) AllNodes() []NodeEntry { return p.allNodes() }
+
+// KeyInUse reports whether the pool file already lists this key.
+func (p *Pool) KeyInUse(k string) bool {
+	for _, m := range p.Members {
+		if m.Key == k {
+			return true
+		}
+	}
+	for _, n := range p.Nodes {
+		if n.Key == k {
+			return true
+		}
+	}
+	return false
 }
 
 type Member struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
+	Name  string `json:"name"`
+	Key   string `json:"key"`
+	Admin bool   `json:"admin,omitempty"` // may invite and remove members
 }
 
 // NodeEntry registers a storage node under the member who runs it. Placement
@@ -217,7 +281,7 @@ func (p *Pool) CoordinatorKey() (ed25519.PublicKey, error) {
 
 // MemberKey returns a member's public key, or nil.
 func (p *Pool) MemberKey(name string) ed25519.PublicKey {
-	for _, m := range p.Members {
+	for _, m := range p.allMembers() {
 		if m.Name == name {
 			b, _ := hex.DecodeString(m.Key)
 			return b
@@ -226,8 +290,18 @@ func (p *Pool) MemberKey(name string) ed25519.PublicKey {
 	return nil
 }
 
+// Member returns a member by name.
+func (p *Pool) Member(name string) (Member, bool) {
+	for _, m := range p.allMembers() {
+		if m.Name == name {
+			return m, true
+		}
+	}
+	return Member{}, false
+}
+
 func (p *Pool) Node(id string) (NodeEntry, bool) {
-	for _, n := range p.Nodes {
+	for _, n := range p.allNodes() {
 		if n.ID == id {
 			return n, true
 		}
@@ -237,14 +311,14 @@ func (p *Pool) Node(id string) (NodeEntry, bool) {
 
 func (p *Pool) Lookup(pub ed25519.PublicKey) (Principal, bool) {
 	k := hex.EncodeToString(pub)
-	for _, m := range p.Members {
+	for _, m := range p.allMembers() {
 		if m.Key == k {
 			return Principal{Member: m.Name}, true
 		}
 	}
-	for i := range p.Nodes {
-		if p.Nodes[i].Key == k {
-			return Principal{Node: &p.Nodes[i]}, true
+	for _, n := range p.allNodes() {
+		if n.Key == k {
+			return Principal{Node: &n}, true
 		}
 	}
 	return Principal{}, false

@@ -3,10 +3,13 @@ package catalog
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+
+	"mediapool/internal/auth"
 )
 
 // Entry types. Every body holds only ciphertext facts and sealed blobs.
@@ -94,17 +97,17 @@ type File struct {
 	Seq uint64 `json:"seq"` // entry that last wrote it
 }
 
-// MemberKeys resolves a member name to its public key, or nil.
-type MemberKeys func(name string) ed25519.PublicKey
-
 type state struct {
-	members  MemberKeys
+	m        membership
 	segments map[string]*Segment
 	files    map[string]*File
 }
 
-func newState(members MemberKeys) state {
-	return state{members: members, segments: map[string]*Segment{}, files: map[string]*File{}}
+func newState() state {
+	return state{
+		m:        membership{members: map[string]auth.Member{}, nodes: map[string]auth.NodeEntry{}, invites: map[string]*invite{}},
+		segments: map[string]*Segment{}, files: map[string]*File{},
+	}
 }
 
 func (s *state) live(id string) (*Segment, error) {
@@ -125,8 +128,8 @@ func (s *state) ref(ids []string, delta int, atMs int64) {
 
 func (s *state) checkAuthor(author string, msg, sig []byte) error {
 	var pub ed25519.PublicKey
-	if s.members != nil {
-		pub = s.members(author)
+	if m, ok := s.m.member(author); ok {
+		pub, _ = hex.DecodeString(m.Key)
 	}
 	if pub == nil {
 		return fmt.Errorf("author %q is not a member", author)
@@ -157,6 +160,9 @@ func (s *state) checkOwner(pathID, author string, replaces uint64) (*File, error
 // apply validates e against the current state and returns the mutation to
 // commit, so an entry that fails to persist leaves the state untouched.
 func (s *state) apply(e *Entry) (func(), error) {
+	if commit, handled, err := s.m.apply(e); handled {
+		return commit, err
+	}
 	decode := func(v any) error { return json.Unmarshal(e.Body, v) }
 	switch e.Type {
 	case TypeSegmentAdd:

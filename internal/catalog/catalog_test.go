@@ -3,10 +3,15 @@ package catalog
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"mediapool/internal/auth"
 )
 
 var (
@@ -16,19 +21,31 @@ var (
 	malloryPub, mallory, _ = ed25519.GenerateKey(rand.Reader)
 )
 
-func members(name string) ed25519.PublicKey {
-	switch name {
-	case "alice":
-		return alicePub
-	case "mallory":
-		return malloryPub
-	}
-	return nil
-}
+var static = &auth.Pool{Members: []auth.Member{
+	{Name: "alice", Key: hex.EncodeToString(alicePub), Admin: true},
+	{Name: "mallory", Key: hex.EncodeToString(malloryPub)},
+}}
 
+// open returns a catalog whose first entries make the founders members,
+// as the coordinator writes them for a new pool.
 func open(t *testing.T, path string) *Catalog {
 	t.Helper()
-	c, err := Open(path, pub, members)
+	c, err := Open(path, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Head().Seq == 0 {
+		for _, m := range static.Members {
+			mustAppend(t, c, TypeMemberAdd, MemberAdd{Name: m.Name, Key: m.Key, Admin: m.Admin})
+		}
+	}
+	return c
+}
+
+// bare returns a catalog with no entries, for replicas that ingest another's.
+func bare(t *testing.T) *Catalog {
+	t.Helper()
+	c, err := Open("", pub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,8 +104,8 @@ func TestReplicaRejectsForgeriesAndForks(t *testing.T) {
 	mustAppend(t, src, TypeSegmentAdd, seg("s2"))
 	entries := src.Entries(1, 10)
 
-	replica := open(t, "")
-	if n, err := replica.Ingest(entries); err != nil || n != 2 {
+	replica := bare(t)
+	if n, err := replica.Ingest(entries); err != nil || n != 4 { // 2 founders + 2 segments
 		t.Fatalf("ingest: n=%d err=%v", n, err)
 	}
 	if n, err := replica.Ingest(entries); err != nil || n != 0 {
@@ -96,7 +113,7 @@ func TestReplicaRejectsForgeriesAndForks(t *testing.T) {
 	}
 
 	// A member who knows the pool secret but not the coordinator key.
-	forger := open(t, "")
+	forger := bare(t)
 	if _, err := forger.Append(forgerKey, TypeSegmentAdd, seg("x")); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("forged signature: %v", err)
 	}
@@ -104,12 +121,12 @@ func TestReplicaRejectsForgeriesAndForks(t *testing.T) {
 	// A tampered body.
 	tampered := entries[0]
 	tampered.Body = []byte(`{"id":"evil","cipher_size":10,"shard_root":"r"}`)
-	if _, err := open(t, "").Ingest([]Entry{tampered}); !errors.Is(err, ErrInvalid) {
+	if _, err := bare(t).Ingest([]Entry{tampered}); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("tampered body: %v", err)
 	}
 
 	// A different history signed by the same key: a fork.
-	other := open(t, "")
+	other := bare(t)
 	mustAppend(t, other, TypeSegmentAdd, seg("s9"))
 	mustAppend(t, other, TypeSegmentAdd, seg("s8"))
 	mustAppend(t, other, TypeSegmentAdd, seg("s7"))
@@ -177,5 +194,58 @@ func TestFileChangesNeedTheAuthor(t *testing.T) {
 	// Replaying the old put after the delete doesn't resurrect anything.
 	if _, err := c.Append(writer, TypeFilePut, put(alice, "alice", "a", a.Seq, "s1")); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("replayed put after delete: %v (delete at %d)", err, d.Seq)
+	}
+}
+
+func keyHex() string {
+	p, _, _ := ed25519.GenerateKey(rand.Reader)
+	return hex.EncodeToString(p)
+}
+
+func TestInvitesAndMembership(t *testing.T) {
+	c := open(t, "")
+	future := time.Now().Add(time.Hour).UnixMilli()
+	code := strings.Repeat("a", 64)
+
+	if _, err := c.Append(writer, TypeInviteCreate, InviteCreate{CodeHash: code, By: "mallory", ExpiresMs: future}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("non-admin created an invite: %v", err)
+	}
+	mustAppend(t, c, TypeInviteCreate, InviteCreate{CodeHash: code, By: "alice", ExpiresMs: future})
+
+	bobKey := keyHex()
+	if _, err := c.Append(writer, TypeMemberAdd, MemberAdd{Name: "bob", Key: bobKey, Invite: code, Admin: true}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invite escalated to admin: %v", err)
+	}
+	mustAppend(t, c, TypeMemberAdd, MemberAdd{Name: "bob", Key: bobKey, Invite: code})
+	if _, err := c.Append(writer, TypeMemberAdd, MemberAdd{Name: "carol", Key: keyHex(), Invite: code}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invite reused: %v", err)
+	}
+	if _, err := c.Append(writer, TypeMemberAdd, MemberAdd{Name: "alice", Key: keyHex()}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("founder name taken over: %v", err)
+	}
+	if _, err := c.Append(writer, TypeNodeAdd, NodeAdd{ID: "n1", Key: bobKey, Owner: "bob"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("key reused for a node: %v", err)
+	}
+	mustAppend(t, c, TypeNodeAdd, NodeAdd{ID: "bob-nas", Key: keyHex(), Owner: "bob"})
+
+	if len(c.JoinedMembers()) != 3 || len(c.JoinedNodes()) != 1 { // two founders + bob
+		t.Fatalf("membership: %v %v", c.JoinedMembers(), c.JoinedNodes())
+	}
+
+	// Expired invites can't be redeemed.
+	old := strings.Repeat("b", 64)
+	mustAppend(t, c, TypeInviteCreate, InviteCreate{CodeHash: old, By: "alice", ExpiresMs: time.Now().Add(-time.Second).UnixMilli()})
+	if _, err := c.Append(writer, TypeMemberAdd, MemberAdd{Name: "dave", Key: keyHex(), Invite: old}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("expired invite redeemed: %v", err)
+	}
+
+	// Removing a member removes their nodes, and survives a replay.
+	mustAppend(t, c, TypeMemberRemove, MemberRemove{Name: "bob"})
+	replica := bare(t)
+	if _, err := replica.Ingest(c.Entries(1, 100)); err != nil {
+		t.Fatal(err)
+	}
+	if len(replica.JoinedMembers()) != 2 || len(replica.JoinedNodes()) != 0 {
+		t.Fatalf("after removal: %v %v", replica.JoinedMembers(), replica.JoinedNodes())
 	}
 }

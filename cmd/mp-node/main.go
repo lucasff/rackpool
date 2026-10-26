@@ -6,6 +6,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,6 +24,7 @@ import (
 	"mediapool/internal/bridge"
 	"mediapool/internal/client"
 	"mediapool/internal/envflag"
+	"mediapool/internal/invite"
 	"mediapool/internal/limits"
 	"mediapool/internal/node"
 	"mediapool/internal/rc"
@@ -42,7 +46,9 @@ func main() {
 	flag.BoolVar(&ro.PortMap, "port-map", true, "ask the router to forward the port automatically (UPnP/NAT-PMP; in Docker this needs host networking)")
 	flag.StringVar(&ro.RelayURL, "relay", "", "relay to use when not directly reachable (default: the coordinator)")
 	flag.StringVar(&cfg.DataDir, "data", "", "shard directory")
-	flag.StringVar(&cfg.CoordURL, "coord", "http://127.0.0.1:7000", "coordinator URL")
+	flag.StringVar(&cfg.CoordURL, "coord", "", "coordinator URL (default: from the invite, else http://127.0.0.1:7000)")
+	inviteStr := flag.String("invite", "", "join the pool with this invite on first start (from `mp invite create`)")
+	memberName := flag.String("member", "", "your member name when joining with -invite (default: the invite's)")
 	flag.DurationVar(&cfg.Heartbeat, "heartbeat", 15*time.Second, "heartbeat interval")
 	flag.Var(&quota, "quota", "most disk to give the pool, e.g. 500G or 2T (0 = whatever is free above -reserve)")
 	flag.Var(&reserve, "reserve", "free disk space to always leave alone")
@@ -81,6 +87,25 @@ func main() {
 		return
 	}
 	cfg.Key = key
+	if *inviteStr != "" {
+		if err := joinWithInvite(*inviteStr, *memberName, &cfg, poolPath, key); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if _, err := os.Stat(*poolPath); err != nil {
+		if saved := filepath.Join(cfg.DataDir, "pool.json"); fileExists(saved) {
+			*poolPath = saved // written when this node joined by invite
+		}
+	}
+	if cfg.CoordURL == "" {
+		cfg.CoordURL = savedCoord(cfg.DataDir)
+	}
+	if cfg.CoordURL == "" {
+		cfg.CoordURL = "http://127.0.0.1:7000"
+	}
+	if cfg.ID == "" {
+		log.Fatal("-id (MP_ID) is required")
+	}
 	ro.Announce, ro.ListenPort = cfg.Addr, node.PortOf(*listen)
 	if ro.RelayURL == "" {
 		ro.RelayURL = cfg.CoordURL
@@ -154,4 +179,72 @@ func startRC(ctx context.Context, n *node.Node, addr, user, pass, member, member
 	}()
 	log.Printf("rc and web UI on http://%s", addr)
 	return nil
+}
+
+// joinWithInvite redeems an invite on first start: it creates this
+// operator's member key next to the node key, registers both, and writes
+// the bootstrap pool file and a settings file for the mp CLI. Later starts
+// see the marker and skip it, so MP_INVITE can stay in the compose file.
+func joinWithInvite(s, member string, cfg *node.Config, poolPath *string, nodeKey ed25519.PrivateKey) error {
+	inv, err := invite.Parse(s)
+	if err != nil {
+		return err
+	}
+	if cfg.CoordURL == "" {
+		cfg.CoordURL = inv.Coord
+	}
+	if _, err := os.Stat(*poolPath); err != nil {
+		*poolPath = filepath.Join(cfg.DataDir, "pool.json")
+	}
+	marker := filepath.Join(cfg.DataDir, "joined")
+	if _, err := os.Stat(marker); err == nil {
+		return nil
+	}
+	if member == "" {
+		member = inv.Name
+	}
+	if member == "" {
+		return fmt.Errorf("set MP_MEMBER: the invite doesn't suggest a member name")
+	}
+	if cfg.ID == "" {
+		cfg.ID = member + "-node"
+	}
+	memberKeyPath := filepath.Join(cfg.DataDir, "member.key")
+	memberKey, err := auth.LoadOrCreateKey(memberKeyPath)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := invite.Redeem(ctx, http.DefaultClient, inv, member, memberKey, cfg.ID, nodeKey); err != nil {
+		return fmt.Errorf("joining the pool: %w", err)
+	}
+	b, _ := json.MarshalIndent(inv.Pool(), "", "  ")
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, "pool.json"), append(b, '\n'), 0o644); err != nil {
+		return err
+	}
+	*poolPath = filepath.Join(cfg.DataDir, "pool.json")
+	env := fmt.Sprintf("# mediapool CLI settings for member %s. Private: holds the pool secret.\nMEDIAPOOL_SECRET=%s\nMP_COORD=%s\nMP_POOL=%s\nMP_MEMBER=%s\nMP_KEY=%s\n",
+		member, inv.Secret, inv.Coord, *poolPath, member, memberKeyPath)
+	if err := os.WriteFile(filepath.Join(cfg.DataDir, "mediapool.env"), []byte(env), 0o600); err != nil {
+		return err
+	}
+	log.Printf("joined the pool as member %s with node %s", member, cfg.ID)
+	return os.WriteFile(marker, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o600)
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// savedCoord reads MP_COORD from the settings written at join time.
+func savedCoord(dataDir string) string {
+	b, err := os.ReadFile(filepath.Join(dataDir, "mediapool.env"))
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "MP_COORD="); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

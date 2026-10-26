@@ -47,10 +47,11 @@ func New(coordURL string, poolSecret []byte, member string, key ed25519.PrivateK
 	if err != nil {
 		return nil, err
 	}
-	cat, err := catalog.Open(catalogPath, coordKey, pool.MemberKey)
+	cat, err := catalog.Open(catalogPath, coordKey)
 	if err != nil {
 		return nil, err
 	}
+	pool.Attach(cat)
 	return &Client{
 		CoordURL: coordURL, PoolSecret: poolSecret, Member: member,
 		SegmentSize: DefaultSegmentSize, HTTP: &http.Client{},

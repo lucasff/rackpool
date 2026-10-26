@@ -30,20 +30,21 @@ import (
 var secret = []byte("test-pool-secret")
 
 type cluster struct {
-	t        *testing.T
-	ctx      context.Context
-	pool     *auth.Pool
-	coordKey ed25519.PrivateKey
-	cfg      coord.Config
-	coord    *coord.Coordinator
-	url      string
-	nodes    []*node.Node
-	direct   map[*node.Node]*deferredHandler
-	relay    *relay.Server
-	paused   map[*node.Node]bool
-	mirror   *bridge.Mirror
-	members  map[string]ed25519.PrivateKey
-	client   *client.Client // member "alice"
+	t         *testing.T
+	ctx       context.Context
+	pool      *auth.Pool
+	coordKey  ed25519.PrivateKey
+	cfg       coord.Config
+	coord     *coord.Coordinator
+	url       string
+	nodes     []*node.Node
+	direct    map[*node.Node]*deferredHandler
+	relay     *relay.Server
+	coordPool *auth.Pool
+	paused    map[*node.Node]bool
+	mirror    *bridge.Mirror
+	members   map[string]ed25519.PrivateKey
+	client    *client.Client // member "alice"
 }
 
 // newCluster starts a coordinator and n storage nodes, each run by its own
@@ -65,6 +66,7 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 		c.pool.Members = append(c.pool.Members, auth.Member{Name: name, Key: auth.PubHex(k)})
 	}
 	addMember("alice")
+	c.pool.Members[0].Admin = true
 	addMember("bob")
 	addMember("mallory")
 
@@ -119,7 +121,7 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 	for _, p := range ps {
 		ncfg := node.Config{
 			ID: p.id, Addr: p.srv.URL, DataDir: t.TempDir(), CoordURL: c.url,
-			Key: p.key, Pool: c.pool, Logf: t.Logf,
+			Key: p.key, Pool: c.pool.Clone(), Logf: t.Logf,
 		}
 		if p.id == "bridge" {
 			ncfg.Source, ncfg.PoolSecret = c.mirror, secret
@@ -140,6 +142,8 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 
 func (c *cluster) startCoord(cfg coord.Config) {
 	c.t.Helper()
+	cfg.Pool = c.pool.Clone() // each process attaches its own catalog
+	c.coordPool = cfg.Pool
 	co, err := coord.New(cfg)
 	if err != nil {
 		c.t.Fatal(err)
@@ -160,7 +164,7 @@ func (c *cluster) startCoord(cfg coord.Config) {
 
 func (c *cluster) newClient(member string) *client.Client {
 	c.t.Helper()
-	cl, err := client.New(c.url, secret, member, c.members[member], c.pool, "")
+	cl, err := client.New(c.url, secret, member, c.members[member], c.pool.Clone(), "")
 	if err != nil {
 		c.t.Fatal(err)
 	}
@@ -730,7 +734,7 @@ func TestDedupSquattingRejected(t *testing.T) {
 func TestSybilNodesShareOneFailureDomain(t *testing.T) {
 	c := newCluster(t, 16, nil)
 	for i := range 8 {
-		c.pool.Nodes[i].Owner = "mallory"
+		c.coordPool.Nodes[i].Owner = "mallory" // the coordinator's view of ownership
 	}
 	c.heartbeat() // the coordinator reads ownership from the pool file on heartbeat
 	if _, err := c.client.Add(c.ctx, bytes.NewReader(randomFile(t, 50<<10)), "/x", nil); err != nil {

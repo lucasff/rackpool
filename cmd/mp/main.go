@@ -60,7 +60,7 @@ func main() {
 	root.AddCommand(catCmd(), sizeCmd(), aboutCmd(), statusCmd())
 	root.AddCommand(copyCmd(false), copyCmd(true), moveCmd(), addCmd(), deleteCmd(), deletefileCmd())
 	root.AddCommand(serveCmd(), rcdCmd(), rcCmd())
-	root.AddCommand(keygenCmd())
+	root.AddCommand(keygenCmd(), poolCmd(), inviteCmd(), joinCmd(), membersCmd(), nodesCmd())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

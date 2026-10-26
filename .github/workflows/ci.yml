@@ -93,6 +93,11 @@ jobs:
           bash scripts/demo.sh 2>&1 | tee demo-output.txt
           grep -qx 'OK: identical' demo-output.txt
           grep -qx 'OK: identical after coordinator recovery' demo-output.txt
+      - name: Run scripts/join-demo.sh
+        run: |
+          bash scripts/join-demo.sh 2>&1 | tee -a demo-output.txt
+          grep -qx 'OK: identical' demo-output.txt
+          grep -q 'invite already used' demo-output.txt
       - name: Upload demo output
         if: failure()
         uses: actions/upload-artifact@v7

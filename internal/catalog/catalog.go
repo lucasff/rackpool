@@ -76,10 +76,10 @@ type Catalog struct {
 }
 
 // Open loads and verifies the log at path, or starts an empty in-memory log
-// when path is "". coord is the coordinator's public key; members resolves
+// when path is "". coord is the coordinator's public key; it verifies
 // file authors. A torn final line left by a crash mid-append is dropped.
-func Open(path string, coord ed25519.PublicKey, members MemberKeys) (*Catalog, error) {
-	c := &Catalog{pub: coord, state: newState(members)}
+func Open(path string, coord ed25519.PublicKey) (*Catalog, error) {
+	c := &Catalog{pub: coord, state: newState()}
 	if path == "" {
 		return c, nil
 	}
@@ -105,7 +105,7 @@ func Open(path string, coord ed25519.PublicKey, members MemberKeys) (*Catalog, e
 		if err := json.Unmarshal(line, &e); err != nil {
 			return fail(fmt.Errorf("entry %d: %w", c.head.Seq+1, err))
 		}
-		if err := c.ingest(e); err != nil {
+		if err := c.ingest(e, false); err != nil {
 			return fail(err)
 		}
 		good += int64(len(line))
@@ -129,8 +129,9 @@ func (c *Catalog) Close() error {
 	return c.file.Close()
 }
 
-// ingest verifies, persists and applies one entry. Caller holds c.mu.
-func (c *Catalog) ingest(e Entry) error {
+// ingest verifies, persists and applies one entry, fsyncing it if sync is
+// set. Caller holds c.mu.
+func (c *Catalog) ingest(e Entry, sync bool) error {
 	if e.Seq <= c.head.Seq && e.Seq > 0 {
 		if c.entries[e.Seq-1].Hash() == e.Hash() {
 			return nil // already have it (a concurrent sync got there first)
@@ -155,8 +156,10 @@ func (c *Catalog) ingest(e Entry) error {
 		if _, err := c.file.Write(append(b, '\n')); err != nil {
 			return err
 		}
-		if err := c.file.Sync(); err != nil {
-			return err
+		if sync {
+			if err := c.file.Sync(); err != nil {
+				return err
+			}
 		}
 	}
 	commit()
@@ -175,18 +178,26 @@ func (c *Catalog) Append(priv ed25519.PrivateKey, typ string, body any) (Entry, 
 	defer c.mu.Unlock()
 	e := Entry{Seq: c.head.Seq + 1, Prev: c.head.Hash, TimeMs: time.Now().UnixMilli(), Type: typ, Body: b}
 	e.Sig = ed25519.Sign(priv, e.signedBytes())
-	return e, c.ingest(e)
+	return e, c.ingest(e, true) // the writer's copy is durable before anyone acts on it
 }
 
 // Ingest appends entries received from another replica, returning how many
-// were new.
-func (c *Catalog) Ingest(entries []Entry) (int, error) {
+// were new. The batch is fsynced once at the end: a replica that crashes
+// mid-batch drops the torn tail on reopen and fetches it again, so per-entry
+// fsyncs (slow, especially on macOS) would buy nothing.
+func (c *Catalog) Ingest(entries []Entry) (n int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	n := 0
+	defer func() {
+		if c.file != nil && n > 0 {
+			if serr := c.file.Sync(); err == nil {
+				err = serr
+			}
+		}
+	}()
 	for _, e := range entries {
 		before := c.head.Seq
-		if err := c.ingest(e); err != nil {
+		if err := c.ingest(e, false); err != nil {
 			return n, err
 		}
 		if c.head.Seq > before {
