@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"mediapool/internal/auth"
 	"mediapool/internal/bridge"
@@ -70,6 +71,7 @@ func (c *Client) Sync(ctx context.Context) error {
 type Manifest struct {
 	Path     string         `json:"path"`
 	Size     int64          `json:"size"`
+	ModTime  int64          `json:"mtime,omitempty"` // unix nanoseconds; 0 if unknown
 	Segments []SegmentEntry `json:"segments"`
 	Author   string         `json:"-"`
 }
@@ -107,15 +109,24 @@ func (c *Client) AddFile(ctx context.Context, localPath, poolPath string, src *S
 		return AddStats{}, err
 	}
 	defer f.Close()
-	return c.Add(ctx, f, poolPath, src)
+	fi, err := f.Stat()
+	if err != nil {
+		return AddStats{}, err
+	}
+	return c.AddWithTime(ctx, f, poolPath, src, fi.ModTime())
 }
 
 func (c *Client) Add(ctx context.Context, r io.Reader, poolPath string, src *Source) (AddStats, error) {
+	return c.AddWithTime(ctx, r, poolPath, src, time.Now())
+}
+
+// AddWithTime is Add with an explicit modification time for the file.
+func (c *Client) AddWithTime(ctx context.Context, r io.Reader, poolPath string, src *Source, modTime time.Time) (AddStats, error) {
 	var params codec.Params
 	if err := transfer.GetJSON(ctx, c.HTTP, c.key, c.CoordURL+"/v1/params", &params); err != nil {
 		return AddStats{}, err
 	}
-	m := Manifest{Path: cleanPath(poolPath)}
+	m := Manifest{Path: cleanPath(poolPath), ModTime: modTime.UnixNano()}
 	var st AddStats
 	buf := make([]byte, c.SegmentSize)
 	for {
@@ -337,6 +348,14 @@ type File struct {
 }
 
 func (f *File) Size() int64 { return f.m.Size }
+
+// Close releases cached segments.
+func (f *File) Close() error {
+	f.mu.Lock()
+	f.cache = map[int]*segmentLoad{}
+	f.mu.Unlock()
+	return nil
+}
 
 func (f *File) load(i int) *segmentLoad {
 	f.mu.Lock()
