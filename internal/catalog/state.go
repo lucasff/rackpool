@@ -98,6 +98,7 @@ type File struct {
 }
 
 type state struct {
+	config   *PoolConfig
 	m        membership
 	segments map[string]*Segment
 	files    map[string]*File
@@ -160,6 +161,9 @@ func (s *state) checkOwner(pathID, author string, replaces uint64) (*File, error
 // apply validates e against the current state and returns the mutation to
 // commit, so an entry that fails to persist leaves the state untouched.
 func (s *state) apply(e *Entry) (func(), error) {
+	if commit, handled, err := s.applyConfig(e); handled {
+		return commit, err
+	}
 	if commit, handled, err := s.m.apply(e); handled {
 		return commit, err
 	}

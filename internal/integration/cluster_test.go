@@ -99,6 +99,7 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 
 	cfg := coord.DefaultConfig()
 	cfg.Params = codec.Params{K: 4, MaxN: 12}
+	cfg.SegmentSize = 64 << 10
 	cfg.AnchoredN, cfg.OrphanN = 6, 9
 	cfg.TargetLoss = 0 // fixed floors; reliability mode has its own test
 	cfg.RepairSlack, cfg.ShrinkSlack = 1, 1
@@ -169,7 +170,6 @@ func (c *cluster) newClient(member string) *client.Client {
 		c.t.Fatal(err)
 	}
 	c.t.Cleanup(func() { cl.Close() })
-	cl.SegmentSize = 64 << 10
 	return cl
 }
 
@@ -884,8 +884,7 @@ func TestDrainEmptiesNodeWithoutLosingDurability(t *testing.T) {
 
 // The upload cap throttles shard serving.
 func TestUploadCapThrottles(t *testing.T) {
-	c := newCluster(t, 12, nil)
-	c.client.SegmentSize = 8 << 20
+	c := newCluster(t, 12, func(cfg *coord.Config) { cfg.SegmentSize = 8 << 20 })
 	data := randomFile(t, 8<<20) // one segment, 2 MiB shards
 	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/big", nil); err != nil {
 		t.Fatal(err)

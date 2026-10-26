@@ -82,6 +82,7 @@ func Start(t testing.TB, n int) *Pool {
 
 	cfg := coord.DefaultConfig()
 	cfg.Params = codec.Params{K: 4, MaxN: 12}
+	cfg.SegmentSize = 64 << 10 // small, so tests cross segment boundaries
 	cfg.AnchoredN, cfg.OrphanN = 6, 9
 	cfg.TargetLoss = 0
 	cfg.RepairSlack, cfg.ShrinkSlack = 1, 1

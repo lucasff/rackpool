@@ -61,3 +61,20 @@ func TestBlobNeedsSecretAndPurpose(t *testing.T) {
 		t.Fatal("opened under wrong purpose")
 	}
 }
+
+func TestDecryptRangeMatchesGCM(t *testing.T) {
+	plain := make([]byte, 100000)
+	for i := range plain {
+		plain[i] = byte(i*7 + i/300)
+	}
+	key, ct, _, _ := SealSegment([]byte("s"), plain)
+	for _, r := range [][2]int{{0, 1}, {0, 16}, {5, 40}, {15, 17}, {4096, 70001}, {99990, 100000}, {0, 100000}} {
+		got, err := DecryptRange(key, ct[r[0]:r[1]], int64(r[0]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, plain[r[0]:r[1]]) {
+			t.Fatalf("range %v decrypts wrong", r)
+		}
+	}
+}

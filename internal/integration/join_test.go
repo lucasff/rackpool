@@ -99,7 +99,6 @@ func TestJoinWithInvite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dave.SegmentSize = 64 << 10
 	if !bytes.Equal(c.readBack(dave, "/movies/A.mkv"), data) {
 		t.Fatal("joined member can't read")
 	}

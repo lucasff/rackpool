@@ -42,6 +42,9 @@ import (
 
 type Config struct {
 	Params codec.Params
+	// SegmentSize is the plaintext bytes per segment. Like Params it's
+	// recorded in the catalog when the pool is created and can't change.
+	SegmentSize int
 
 	// Durability floors. Anchored segments have a verified healthy external
 	// swarm to fall back on and run lean; orphans carry full redundancy.
@@ -114,6 +117,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Params:             codec.Params{K: 10, MaxN: 40},
+		SegmentSize:        16 << 20,
 		AnchoredN:          14,
 		OrphanN:            30,
 		TargetLoss:         1e-9,
@@ -269,7 +273,7 @@ func New(cfg Config) (*Coordinator, error) {
 	}
 	if cat.Head().Seq > 0 || cfg.Fresh {
 		c.ready = true
-		if err := c.ensureFounders(); err != nil {
+		if err := c.initCatalog(); err != nil {
 			return nil, err
 		}
 	} else {
@@ -1034,8 +1038,10 @@ func (c *Coordinator) recoverLocked() {
 		}
 	}
 	c.ready, c.blocked = true, ""
-	if err := c.ensureFounders(); err != nil {
-		c.cfg.Logf("coordinator: recording founders: %v", err)
+	if err := c.initCatalog(); err != nil {
+		c.ready, c.blocked = false, err.Error()
+		c.cfg.Logf("coordinator: %v", err)
+		return
 	}
 	c.cfg.Logf("coordinator: recovered %d catalog entries from %s, head %d", got, id, c.cat.Head().Seq)
 }
@@ -1624,6 +1630,22 @@ func (c *Coordinator) saveScores(now time.Time) {
 }
 
 // --- membership -------------------------------------------------------------
+
+// initCatalog records the pool configuration and the founders on a new
+// pool, and on an existing one checks the configured parameters still match
+// the ones the pool was created with.
+func (c *Coordinator) initCatalog() error {
+	want := catalog.PoolConfig{SegmentSize: c.cfg.SegmentSize, K: c.cfg.Params.K, MaxN: c.cfg.Params.MaxN}
+	if have, ok := c.cat.Config(); ok {
+		if have != want {
+			return fmt.Errorf("this pool was created with segment size %d, k=%d, max_n=%d; the coordinator is configured with %d, %d, %d (these can't change: fix the flags)",
+				have.SegmentSize, have.K, have.MaxN, want.SegmentSize, want.K, want.MaxN)
+		}
+	} else if _, err := c.appendEntry(catalog.TypePoolConfig, want); err != nil {
+		return fmt.Errorf("recording pool configuration: %w", err)
+	}
+	return c.ensureFounders()
+}
 
 // ensureFounders records pool.json's members and nodes in the catalog if
 // they aren't there yet. On a new pool these become the first entries, so

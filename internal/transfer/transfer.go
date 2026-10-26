@@ -19,9 +19,50 @@ import (
 )
 
 const (
-	ProofHeader  = "X-Shard-Proof"
-	TicketHeader = "X-Upload-Ticket"
+	ProofHeader      = "X-Shard-Proof"
+	TicketHeader     = "X-Upload-Ticket"
+	ShardHashHeader  = "X-Shard-Hash"
+	ChunkProofHeader = "X-Chunk-Proof"
 )
+
+// GetChunk fetches chunk c of shard idx and verifies it against the segment
+// root: the shard hash must be in the segment tree and the chunk in the
+// shard's tree. shardSize is computed by the caller from the catalog.
+func GetChunk(ctx context.Context, hc *http.Client, s Signer, addr, seg string, idx int, root merkle.Hash, maxN, shardSize, c int) ([]byte, error) {
+	u := fmt.Sprintf("%s/v1/chunk/%s/%d?root=%s&chunk=%d", addr, seg, idx, codec.HashToHex(root), c)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if s != nil {
+		s.Sign(req, nil)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &HTTPError{resp.StatusCode, fmt.Sprintf("get chunk %.12s/%d/%d from %s: %s", seg, idx, c, addr, resp.Status)}
+	}
+	shardHash, err := codec.HexToHash(resp.Header.Get(ShardHashHeader))
+	if err != nil {
+		return nil, err
+	}
+	segProof, err1 := codec.DecodeProof(resp.Header.Get(ProofHeader))
+	chunkProof, err2 := codec.DecodeProof(resp.Header.Get(ChunkProofHeader))
+	if err1 != nil || err2 != nil {
+		return nil, errors.New("malformed chunk proof")
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, codec.ChunkSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if !codec.VerifyShardHash(root, maxN, idx, shardHash, segProof) || !codec.VerifyChunk(shardHash, shardSize, c, data, chunkProof) {
+		return nil, fmt.Errorf("chunk %.12s/%d/%d from %s doesn't verify", seg, idx, c, addr)
+	}
+	return data, nil
+}
 
 // Signer authenticates an outgoing request (auth.Identity implements it).
 type Signer interface {

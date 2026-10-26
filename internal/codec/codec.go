@@ -163,3 +163,31 @@ func Join(p Params, shards [][]byte, size int) ([]byte, error) {
 	}
 	return buf.Bytes(), nil
 }
+
+// DecryptRange decrypts ct, which starts at byte offset off of a segment's
+// ciphertext, without the rest of the segment. AES-GCM encrypts with AES
+// in counter mode, so any range can be decrypted on its own: block n of
+// the ciphertext uses counter 2+n under our all-zero nonce. This skips the
+// GCM tag check, so callers must verify ct by other means (shard chunks are
+// verified against Merkle proofs that chain to the segment root in the
+// signed catalog). ct must not extend into the 16-byte tag.
+func DecryptRange(key, ct []byte, off int64) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	var iv [16]byte // nonce (12 zero bytes) || 32-bit big-endian counter
+	ctr := uint32(2 + off/16)
+	iv[12], iv[13], iv[14], iv[15] = byte(ctr>>24), byte(ctr>>16), byte(ctr>>8), byte(ctr)
+	stream := cipher.NewCTR(block, iv[:])
+	if skip := int(off % 16); skip > 0 {
+		var discard [16]byte
+		stream.XORKeyStream(discard[:skip], discard[:skip])
+	}
+	out := make([]byte, len(ct))
+	stream.XORKeyStream(out, ct)
+	return out, nil
+}
+
+// PlainSize is a segment's plaintext length for a given ciphertext length.
+func PlainSize(cipherSize int) int { return cipherSize - 16 }

@@ -20,6 +20,7 @@ import (
 	"mediapool/internal/auth"
 	"mediapool/internal/catalog"
 	"mediapool/internal/invite"
+	"mediapool/internal/limits"
 	"mediapool/internal/transfer"
 )
 
@@ -48,6 +49,7 @@ func poolCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "pool", Short: "Create a pool"}
 	var dir, name, coordURL string
 	var tunnel bool
+	var segSize string
 	initCmd := &cobra.Command{
 		Use:   "init",
 		Short: "Create a new pool: keys, secret, pool.json and a Docker Compose file for the founder",
@@ -110,7 +112,14 @@ func poolCmd() *cobra.Command {
 			if _, err := rand.Read(rcPass); err != nil {
 				return err
 			}
-			envVars := [][2]string{{"NODE_ID", nodeID}, {"POOL_URL", coordURL}, {"RC_PASS", base64.RawURLEncoding.EncodeToString(rcPass)}}
+			var sb limits.Bytes
+			if err := sb.Set(segSize); err != nil {
+				return fmt.Errorf("--segment-size: %w", err)
+			}
+			if err := (catalog.PoolConfig{SegmentSize: int(sb), K: 10, MaxN: 40}).Validate(); err != nil {
+				return fmt.Errorf("--segment-size: %w", err)
+			}
+			envVars := [][2]string{{"NODE_ID", nodeID}, {"POOL_URL", coordURL}, {"RC_PASS", base64.RawURLEncoding.EncodeToString(rcPass)}, {"SEGMENT_SIZE", segSize}}
 			if tunnel {
 				if u.Scheme != "https" {
 					return errors.New("with --tunnel, --coord-url is your tunnel's public hostname: https://pool.example.com")
@@ -144,6 +153,7 @@ Next:
 	initCmd.Flags().StringVar(&dir, "dir", "mediapool", "directory to create the pool in")
 	initCmd.Flags().StringVar(&name, "name", "", "your member name")
 	initCmd.Flags().StringVar(&coordURL, "coord-url", "", "public URL of your coordinator, e.g. http://you.duckdns.org:7000, or https://pool.example.com with --tunnel")
+	initCmd.Flags().StringVar(&segSize, "segment-size", "16Mi", "plaintext bytes per segment, fixed for the pool's lifetime: smaller starts playback and seeks faster, larger means fewer files and requests")
 	initCmd.Flags().BoolVar(&tunnel, "tunnel", false, "expose the coordinator through a Cloudflare Tunnel: no open ports, your IP hidden from members")
 	_ = initCmd.MarkFlagRequired("name")
 	cmd.AddCommand(initCmd)

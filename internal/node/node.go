@@ -363,6 +363,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/shards/{seg}/{idx}", n.handlePut)
 	mux.HandleFunc("GET /v1/proof/{seg}/{idx}", n.handleProof)
 	mux.HandleFunc("GET /v1/ping", n.handlePing)
+	mux.HandleFunc("GET /v1/chunk/{seg}/{idx}", n.authed(n.handleChunk))
 	mux.HandleFunc("GET /v1/log", n.authed(n.cat.ServeLog))
 	return mux
 }
@@ -563,6 +564,41 @@ func (t *throttled) Read(p []byte) (int, error) {
 		}
 	}
 	return m, err
+}
+
+// handleChunk serves one ChunkSize piece of a shard with the proofs that
+// chain it to the segment root, so readers can fetch just the part of a
+// file they need and still verify every byte.
+func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	k, err := parseKey(r, q.Get("root"))
+	chunk, cerr := strconv.Atoi(q.Get("chunk"))
+	if err != nil || cerr != nil {
+		http.Error(w, "bad chunk request", http.StatusBadRequest)
+		return
+	}
+	data, segProof, err := n.readShard(k)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	c, cp, err := codec.ChunkProof(data, chunk)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	done, ok := n.slot(r)
+	if !ok {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer done()
+	h := w.Header()
+	h.Set(transfer.ShardHashHeader, codec.HashToHex(codec.ShardHash(data)))
+	h.Set(transfer.ProofHeader, segProof)
+	h.Set(transfer.ChunkProofHeader, codec.EncodeProof(cp))
+	h.Set("Content-Length", strconv.Itoa(len(c)))
+	_, _ = limits.Writer{Ctx: r.Context(), W: w, B: n.up}.Write(c)
 }
 
 // handleProof answers a storage challenge: chunk c of a shard with Merkle

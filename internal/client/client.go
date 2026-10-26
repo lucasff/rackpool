@@ -23,18 +23,16 @@ import (
 	"mediapool/internal/bridge"
 	"mediapool/internal/catalog"
 	"mediapool/internal/codec"
+	"mediapool/internal/merkle"
 	"mediapool/internal/proto"
 	"mediapool/internal/transfer"
 )
 
-const DefaultSegmentSize = 64 << 20
-
 type Client struct {
-	CoordURL    string
-	PoolSecret  []byte
-	Member      string
-	SegmentSize int
-	HTTP        *http.Client
+	CoordURL   string
+	PoolSecret []byte
+	Member     string
+	HTTP       *http.Client
 
 	key *auth.Identity
 	cat *catalog.Catalog
@@ -54,12 +52,28 @@ func New(coordURL string, poolSecret []byte, member string, key ed25519.PrivateK
 	pool.Attach(cat)
 	return &Client{
 		CoordURL: coordURL, PoolSecret: poolSecret, Member: member,
-		SegmentSize: DefaultSegmentSize, HTTP: &http.Client{},
-		key: auth.NewIdentity(key), cat: cat,
+		HTTP: &http.Client{},
+		key:  auth.NewIdentity(key), cat: cat,
 	}, nil
 }
 
 func (c *Client) Close() error { return c.cat.Close() }
+
+// PoolConfig returns the parameters the pool was created with, from the
+// signed catalog. Every member cuts files with the same segment size, which
+// is what lets identical files dedup.
+func (c *Client) PoolConfig(ctx context.Context) (catalog.PoolConfig, error) {
+	if cfg, ok := c.cat.Config(); ok {
+		return cfg, nil
+	}
+	if err := c.Sync(ctx); err != nil {
+		return catalog.PoolConfig{}, err
+	}
+	if cfg, ok := c.cat.Config(); ok {
+		return cfg, nil
+	}
+	return catalog.PoolConfig{}, errors.New("the pool's catalog has no configuration entry")
+}
 
 // Sync pulls new catalog entries from the coordinator.
 func (c *Client) Sync(ctx context.Context) error {
@@ -123,13 +137,14 @@ func (c *Client) Add(ctx context.Context, r io.Reader, poolPath string, src *Sou
 
 // AddWithTime is Add with an explicit modification time for the file.
 func (c *Client) AddWithTime(ctx context.Context, r io.Reader, poolPath string, src *Source, modTime time.Time) (AddStats, error) {
-	var params codec.Params
-	if err := transfer.GetJSON(ctx, c.HTTP, c.key, c.CoordURL+"/v1/params", &params); err != nil {
+	cfg, err := c.PoolConfig(ctx)
+	if err != nil {
 		return AddStats{}, err
 	}
+	params := codec.Params{K: cfg.K, MaxN: cfg.MaxN}
 	m := Manifest{Path: cleanPath(poolPath), ModTime: modTime.UnixNano()}
 	var st AddStats
-	buf := make([]byte, c.SegmentSize)
+	buf := make([]byte, cfg.SegmentSize)
 	for {
 		nr, err := io.ReadFull(r, buf)
 		if nr > 0 {
@@ -303,21 +318,44 @@ func (c *Client) Status(ctx context.Context) (proto.StatusResponse, error) {
 	return st, err
 }
 
-// ReadSegment fetches, verifies, decodes and decrypts one segment.
-func (c *Client) ReadSegment(ctx context.Context, e SegmentEntry) ([]byte, error) {
-	var loc proto.LocateResponse
-	if err := transfer.GetJSON(ctx, c.HTTP, c.key, c.CoordURL+"/v1/locate/"+e.ID, &loc); err != nil {
-		return nil, err
+// located is where a segment's shards are, checked against our catalog.
+type located struct {
+	loc  proto.LocateResponse
+	seg  catalog.Segment
+	root merkle.Hash
+}
+
+func (c *Client) locate(ctx context.Context, id string) (located, error) {
+	var l located
+	if err := transfer.GetJSON(ctx, c.HTTP, c.key, c.CoordURL+"/v1/locate/"+id, &l.loc); err != nil {
+		return l, err
 	}
 	// Verify against the root in our own replica, not the coordinator's word.
-	s, ok := c.cat.Segment(e.ID)
-	if !ok || s.ShardRoot != loc.Root {
-		return nil, fmt.Errorf("segment %.12s: coordinator root disagrees with the catalog", e.ID)
+	s, ok := c.cat.Segment(id)
+	if !ok || s.ShardRoot != l.loc.Root {
+		return l, fmt.Errorf("segment %.12s: coordinator root disagrees with the catalog", id)
 	}
 	root, err := codec.HexToHash(s.ShardRoot)
 	if err != nil {
+		return l, err
+	}
+	l.seg, l.root = s, root
+	return l, nil
+}
+
+// ReadSegment fetches, verifies, decodes and decrypts one whole segment.
+func (c *Client) ReadSegment(ctx context.Context, e SegmentEntry) ([]byte, error) {
+	l, err := c.locate(ctx, e.ID)
+	if err != nil {
 		return nil, err
 	}
+	return c.decodeSegment(ctx, e, l)
+}
+
+// decodeSegment rebuilds a segment from any k shards and checks it with the
+// GCM tag: the path that works whichever shards are online.
+func (c *Client) decodeSegment(ctx context.Context, e SegmentEntry, l located) ([]byte, error) {
+	loc, s, root := l.loc, l.seg, l.root
 	shards, err := transfer.FetchAny(ctx, c.HTTP, c.key, e.ID, loc.Shards, root, loc.Params.K, loc.Params.MaxN)
 	if err != nil {
 		return nil, err
@@ -330,115 +368,4 @@ func (c *Client) ReadSegment(ctx context.Context, e SegmentEntry) ([]byte, error
 		return nil, errors.New("reassembled segment doesn't match its id")
 	}
 	return codec.OpenSegment(e.Key, ct)
-}
-
-// Open returns a seekable reader over a pool file. It keeps the current
-// segment in memory and prefetches the next, so sequential playback rarely
-// waits on the network.
-func (c *Client) Open(ctx context.Context, m Manifest) *File {
-	return &File{c: c, ctx: ctx, m: m, cache: map[int]*segmentLoad{}}
-}
-
-type segmentLoad struct {
-	done chan struct{}
-	data []byte
-	err  error
-}
-
-type File struct {
-	c   *Client
-	ctx context.Context
-	m   Manifest
-	off int64
-
-	mu    sync.Mutex
-	cache map[int]*segmentLoad
-}
-
-func (f *File) Size() int64 { return f.m.Size }
-
-// Close releases cached segments.
-func (f *File) Close() error {
-	f.mu.Lock()
-	f.cache = map[int]*segmentLoad{}
-	f.mu.Unlock()
-	return nil
-}
-
-func (f *File) load(i int) *segmentLoad {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if l, ok := f.cache[i]; ok {
-		return l
-	}
-	l := &segmentLoad{done: make(chan struct{})}
-	f.cache[i] = l
-	go func() {
-		l.data, l.err = f.c.ReadSegment(f.ctx, f.m.Segments[i])
-		close(l.done)
-	}()
-	for k := range f.cache { // keep only the segments around the playhead
-		if k < i-1 || k > i+1 {
-			delete(f.cache, k)
-		}
-	}
-	return l
-}
-
-func (f *File) segmentAt(off int64) (idx int, start int64) {
-	for i, s := range f.m.Segments {
-		if off < start+s.PlainSize {
-			return i, start
-		}
-		start += s.PlainSize
-	}
-	return len(f.m.Segments), start
-}
-
-func (f *File) ReadAt(p []byte, off int64) (int, error) {
-	n := 0
-	for n < len(p) {
-		if off >= f.m.Size {
-			return n, io.EOF
-		}
-		i, start := f.segmentAt(off)
-		l := f.load(i)
-		if i+1 < len(f.m.Segments) {
-			f.load(i + 1)
-		}
-		<-l.done
-		if l.err != nil {
-			f.mu.Lock()
-			delete(f.cache, i) // don't keep a failed load around
-			f.mu.Unlock()
-			return n, l.err
-		}
-		c := copy(p[n:], l.data[off-start:])
-		n += c
-		off += int64(c)
-	}
-	return n, nil
-}
-
-func (f *File) Read(p []byte) (int, error) {
-	n, err := f.ReadAt(p, f.off)
-	f.off += int64(n)
-	return n, err
-}
-
-func (f *File) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case io.SeekStart:
-	case io.SeekCurrent:
-		offset += f.off
-	case io.SeekEnd:
-		offset += f.m.Size
-	default:
-		return 0, errors.New("seek: bad whence")
-	}
-	if offset < 0 {
-		return 0, errors.New("seek: negative offset")
-	}
-	f.off = offset
-	return offset, nil
 }

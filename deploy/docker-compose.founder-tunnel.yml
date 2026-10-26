@@ -42,6 +42,7 @@ services:
       MP_CATALOG: /data/catalog.log
       MP_SCORES: /data/scores.json
       MP_FRESH: "true" # creates the pool on first start; safe afterwards
+      MP_SEGMENT_SIZE: ${SEGMENT_SIZE:-16Mi} # fixed when the pool is created
       MP_RELAY_LIMIT: ${RELAY_LIMIT:-0} # cap per relayed node, e.g. 50M
 
   node:

@@ -22,6 +22,8 @@ func main() {
 	keyPath := flag.String("key", "coord.key", "coordinator private key")
 	flag.StringVar(&cfg.LogPath, "catalog", "catalog.log", "catalog log file")
 	flag.BoolVar(&cfg.Fresh, "fresh", false, "start a new pool (otherwise an empty catalog is recovered from nodes)")
+	seg := limits.Bytes(cfg.SegmentSize)
+	flag.Var(&seg, "segment-size", "plaintext bytes per segment, e.g. 16Mi; fixed when the pool is created")
 	flag.IntVar(&cfg.Params.K, "k", cfg.Params.K, "data shards per segment")
 	flag.IntVar(&cfg.Params.MaxN, "max-n", cfg.Params.MaxN, "total shard indices per segment (cap for hot expansion)")
 	flag.IntVar(&cfg.AnchoredN, "anchored-n", cfg.AnchoredN, "shards for segments with a verified external swarm")
@@ -45,6 +47,7 @@ func main() {
 		log.Fatal(err)
 	}
 	cfg.Logf = log.Printf
+	cfg.SegmentSize = int(seg)
 	cfg.Reliability.OfflineAfter = cfg.OfflineAfter
 
 	var err error
