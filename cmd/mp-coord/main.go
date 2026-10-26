@@ -1,0 +1,50 @@
+// mp-coord runs a pool coordinator.
+package main
+
+import (
+	"flag"
+	"log"
+	"net/http"
+
+	"mediapool/internal/auth"
+	"mediapool/internal/coord"
+)
+
+func main() {
+	cfg := coord.DefaultConfig()
+	listen := flag.String("listen", ":7000", "listen address")
+	poolPath := flag.String("pool", "pool.json", "pool membership file")
+	keyPath := flag.String("key", "coord.key", "coordinator private key")
+	flag.StringVar(&cfg.LogPath, "catalog", "catalog.log", "catalog log file")
+	flag.BoolVar(&cfg.Fresh, "fresh", false, "start a new pool (otherwise an empty catalog is recovered from nodes)")
+	flag.IntVar(&cfg.Params.K, "k", cfg.Params.K, "data shards per segment")
+	flag.IntVar(&cfg.Params.MaxN, "max-n", cfg.Params.MaxN, "total shard indices per segment (cap for hot expansion)")
+	flag.IntVar(&cfg.AnchoredN, "anchored-n", cfg.AnchoredN, "shards for segments with a verified external swarm")
+	flag.IntVar(&cfg.OrphanN, "orphan-n", cfg.OrphanN, "shards for segments without one")
+	flag.IntVar(&cfg.RepairSlack, "repair-slack", cfg.RepairSlack, "repair once this many shards below the floor")
+	flag.Float64Var(&cfg.HotReadsPerShard, "hot-reads-per-shard", cfg.HotReadsPerShard, "reads/min that earn one extra shard")
+	flag.DurationVar(&cfg.OfflineAfter, "offline-after", cfg.OfflineAfter, "heartbeat silence before a node stops serving reads")
+	flag.DurationVar(&cfg.DownAfter, "down-after", cfg.DownAfter, "heartbeat silence before a node's shards are rebuilt elsewhere")
+	flag.DurationVar(&cfg.SwarmCheckEvery, "swarm-check-every", cfg.SwarmCheckEvery, "how often bridges re-check external swarms")
+	flag.DurationVar(&cfg.GCGrace, "gc-grace", cfg.GCGrace, "how long a segment sits unreferenced before collection")
+	flag.DurationVar(&cfg.TickEvery, "tick", cfg.TickEvery, "scheduler interval")
+	flag.Parse()
+	cfg.Logf = log.Printf
+
+	pool, err := auth.LoadPool(*poolPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if cfg.Key, err = auth.LoadOrCreateKey(*keyPath); err != nil {
+		log.Fatal(err)
+	}
+	cfg.Pool = pool
+	c, err := coord.New(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+	go c.Run(make(chan struct{}))
+	log.Printf("coordinator on %s (k=%d anchored=%d orphan=%d max=%d, %d members, %d nodes)",
+		*listen, cfg.Params.K, cfg.AnchoredN, cfg.OrphanN, cfg.Params.MaxN, len(pool.Members), len(pool.Nodes))
+	log.Fatal(http.ListenAndServe(*listen, c.Handler()))
+}
