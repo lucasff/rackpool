@@ -28,7 +28,7 @@ done
 echo "{\"coordinator\":\"$COORD_PUB\",\"members\":[${members%,}],\"nodes\":[${nodes%,}]}" >"$W/pool.json"
 
 COORD_FLAGS=(-pool "$W/pool.json" -key "$W/coord.key" -k 4 -max-n 16 -anchored-n 6 -orphan-n 9
-  -repair-slack 0 -offline-after 3s -down-after 8s -swarm-check-every 2s -gc-grace 2s -tick 1s)
+  -target-loss 0 -scores "$W/scores.json" -repair-slack 0 -offline-after 3s -down-after 8s -swarm-check-every 2s -gc-grace 2s -tick 1s)
 bin/mp-coord "${COORD_FLAGS[@]}" -catalog "$W/catalog.log" -fresh 2>"$W/coord.log" & COORD=$!
 pids+=($COORD)
 sleep 0.5

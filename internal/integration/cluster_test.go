@@ -21,6 +21,7 @@ import (
 	"mediapool/internal/coord"
 	"mediapool/internal/node"
 	"mediapool/internal/proto"
+	"mediapool/internal/reliability"
 )
 
 var secret = []byte("test-pool-secret")
@@ -92,6 +93,7 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 	cfg := coord.DefaultConfig()
 	cfg.Params = codec.Params{K: 4, MaxN: 12}
 	cfg.AnchoredN, cfg.OrphanN = 6, 9
+	cfg.TargetLoss = 0 // fixed floors; reliability mode has its own test
 	cfg.RepairSlack, cfg.ShrinkSlack = 1, 1
 	cfg.HotReadsPerShard = 1e9 // no heat unless a test asks for it
 	cfg.HeatTau = 2 * time.Second
@@ -722,5 +724,50 @@ func TestSybilNodesShareOneFailureDomain(t *testing.T) {
 	}
 	if owned > 1 {
 		t.Fatalf("one owner holds %d shards of a segment", owned)
+	}
+}
+
+// Reliability-aware placement: a segment's redundancy follows how much its
+// holders can be trusted. Proven owners let it run lean; when holders start
+// failing proofs, the pool adds redundancy on its own.
+func TestRedundancyFollowsReliability(t *testing.T) {
+	c := newCluster(t, 20, func(cfg *coord.Config) {
+		cfg.TargetLoss, cfg.AnchoredTargetLoss = 1e-6, 1e-3
+		cfg.MinN, cfg.ShrinkMargin = 6, 10
+		cfg.Reliability = reliability.DefaultParams()
+		cfg.Reliability.OfflineAfter = cfg.OfflineAfter
+		cfg.Reliability.PriorWeight = 2 * time.Second // new owners earn trust in seconds here
+		cfg.Reliability.PriorProofs = 2
+		cfg.Reliability.HalfLife = time.Hour
+	})
+	data := randomFile(t, 50<<10)
+	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/x", nil); err != nil {
+		t.Fatal(err)
+	}
+	// New owners start pessimistic, so the segment starts wide.
+	first := c.settle("placed", 5*time.Second, func(s proto.SegmentStatus) bool { return s.Durable >= 9 && !s.Repairing })
+	t.Logf("new owners: %d shards, loss %.1e", first.Durable, first.LossProb)
+
+	// As owners prove themselves the estimate falls and the pool shrinks it.
+	lean := c.settle("shrunk on proven owners", 20*time.Second, func(s proto.SegmentStatus) bool {
+		return s.Durable < first.Durable && s.LossProb <= 1e-6 && !s.Repairing
+	})
+	t.Logf("proven owners: %d shards, loss %.1e", lean.Durable, lean.LossProb)
+
+	// Holders go bad: their shard files silently rot, so proofs start failing.
+	for _, n := range c.holders(lean.ID)[:lean.Durable/2] {
+		filepath.WalkDir(filepath.Join(n.DataDir(), "shards"), func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && filepath.Ext(p) != ".proof" {
+				os.WriteFile(p, bytes.Repeat([]byte{0}, 64), 0o644)
+			}
+			return nil
+		})
+	}
+	healed := c.settle("redundancy restored on good owners", 20*time.Second, func(s proto.SegmentStatus) bool {
+		return s.LossProb <= 1e-6 && s.Online >= 6 && !s.Repairing
+	})
+	t.Logf("after rot: %d shards, loss %.1e", healed.Durable, healed.LossProb)
+	if !bytes.Equal(c.readBack(c.client, "/x"), data) {
+		t.Fatal("data unreadable after holders rotted")
 	}
 }

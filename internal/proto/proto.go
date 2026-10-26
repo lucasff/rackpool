@@ -189,6 +189,7 @@ type NodeStatus struct {
 	Online   bool      `json:"online"`
 	Shards   int       `json:"shards"`
 	Strikes  int       `json:"strikes"`
+	FailProb float64   `json:"fail_prob"`
 	LastSeen time.Time `json:"last_seen"`
 }
 
@@ -200,6 +201,7 @@ type SegmentStatus struct {
 	Durable    int     `json:"durable"`
 	Online     int     `json:"online"`
 	HeatPerMin float64 `json:"heat_per_min"`
+	LossProb   float64 `json:"loss_prob"`
 	Repairing  bool    `json:"repairing"`
 }
 

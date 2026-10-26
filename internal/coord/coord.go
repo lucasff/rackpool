@@ -24,6 +24,7 @@ import (
 	mrand "math/rand/v2"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"sync"
@@ -33,6 +34,7 @@ import (
 	"mediapool/internal/catalog"
 	"mediapool/internal/codec"
 	"mediapool/internal/proto"
+	"mediapool/internal/reliability"
 	"mediapool/internal/transfer"
 )
 
@@ -43,6 +45,21 @@ type Config struct {
 	// swarm to fall back on and run lean; orphans carry full redundancy.
 	AnchoredN int
 	OrphanN   int
+
+	// Reliability-aware durability. With TargetLoss set, a segment's shard
+	// count is driven by the estimated chance of losing it, computed from
+	// each holder's observed reliability, instead of the fixed floors:
+	// shards on proven owners go further, shards on new or flaky owners
+	// need company. Anchored segments use the looser AnchoredTargetLoss,
+	// since the public swarm backs them. MinN bounds how lean it may get.
+	// ShrinkMargin is hysteresis: shards are dropped only while the loss
+	// estimate stays below TargetLoss/ShrinkMargin.
+	TargetLoss         float64
+	AnchoredTargetLoss float64
+	MinN               int
+	ShrinkMargin       float64
+	Reliability        reliability.Params
+	ScoresPath         string
 
 	// Lazy repair: rebuild only once durable shards drop this far below the
 	// floor. Hot expansion is not lazy.
@@ -94,23 +111,28 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		Params:           codec.Params{K: 10, MaxN: 40},
-		AnchoredN:        14,
-		OrphanN:          30,
-		RepairSlack:      3,
-		ShrinkSlack:      1,
-		HotReadsPerShard: 2,
-		HeatTau:          30 * time.Minute,
-		HotBudget:        10000,
-		OfflineAfter:     2 * time.Minute,
-		DownAfter:        48 * time.Hour,
-		ProofsPerTick:    4,
-		MaxStrikes:       3,
-		GCGrace:          24 * time.Hour,
-		TaskTimeout:      10 * time.Minute,
-		TicketTTL:        30 * time.Minute,
-		SwarmCheckEvery:  6 * time.Hour,
-		TickEvery:        10 * time.Second,
+		Params:             codec.Params{K: 10, MaxN: 40},
+		AnchoredN:          14,
+		OrphanN:            30,
+		TargetLoss:         1e-9,
+		AnchoredTargetLoss: 1e-5,
+		MinN:               12,
+		ShrinkMargin:       100,
+		Reliability:        reliability.DefaultParams(),
+		RepairSlack:        3,
+		ShrinkSlack:        1,
+		HotReadsPerShard:   2,
+		HeatTau:            30 * time.Minute,
+		HotBudget:          10000,
+		OfflineAfter:       2 * time.Minute,
+		DownAfter:          48 * time.Hour,
+		ProofsPerTick:      4,
+		MaxStrikes:         3,
+		GCGrace:            24 * time.Hour,
+		TaskTimeout:        10 * time.Minute,
+		TicketTTL:          30 * time.Minute,
+		SwarmCheckEvery:    6 * time.Hour,
+		TickEvery:          10 * time.Second,
 	}
 }
 
@@ -121,6 +143,9 @@ func (c Config) Validate() error {
 	if c.AnchoredN < c.Params.K || c.OrphanN < c.AnchoredN || c.OrphanN > c.Params.MaxN {
 		return fmt.Errorf("coord: need k <= anchored_n <= orphan_n <= max_n, got %d/%d/%d/%d",
 			c.Params.K, c.AnchoredN, c.OrphanN, c.Params.MaxN)
+	}
+	if c.TargetLoss > 0 && (c.MinN < c.Params.K || c.MinN > c.Params.MaxN || c.ShrinkMargin < 1) {
+		return fmt.Errorf("coord: need k <= min_n <= max_n and shrink_margin >= 1")
 	}
 	if c.Key == nil || c.Pool == nil {
 		return errors.New("coord: key and pool are required")
@@ -181,14 +206,16 @@ type Coordinator struct {
 	id     *auth.Identity
 	verify auth.Verifier
 
-	mu       sync.Mutex
-	nodes    map[string]*node
-	segs     map[string]*segInfo
-	uploads  map[string]*upload
-	taskSeq  int
-	bridgeRR int
-	ready    bool
-	blocked  string // why writes are refused, if they are
+	mu          sync.Mutex
+	nodes       map[string]*node
+	segs        map[string]*segInfo
+	uploads     map[string]*upload
+	taskSeq     int
+	bridgeRR    int
+	ready       bool
+	blocked     string                        // why writes are refused, if they are
+	scores      map[string]*reliability.Score // by owner
+	scoresSaved time.Time
 }
 
 func New(cfg Config) (*Coordinator, error) {
@@ -208,6 +235,14 @@ func New(cfg Config) (*Coordinator, error) {
 	c := &Coordinator{
 		cfg: cfg, cat: cat, id: auth.NewIdentity(cfg.Key),
 		nodes: map[string]*node{}, segs: map[string]*segInfo{}, uploads: map[string]*upload{},
+		scores: map[string]*reliability.Score{},
+	}
+	if cfg.Reliability.OfflineAfter == 0 {
+		c.cfg.Reliability = reliability.DefaultParams()
+		c.cfg.Reliability.OfflineAfter = cfg.OfflineAfter
+	}
+	if err := c.loadScores(); err != nil {
+		return nil, err
 	}
 	if cat.Head().Seq > 0 || cfg.Fresh {
 		c.ready = true
@@ -416,6 +451,16 @@ func (c *Coordinator) pickNodes(n int, excludeOwners map[string]bool, preferBrid
 			cands = append(cands, nd)
 		}
 	}
+	// With reliability on, prefer proven owners (bucketed, so similar
+	// owners still share load evenly). New owners sort last: they get
+	// shards when the proven ones are exhausted or already hold one, and
+	// earn trust from uptime and proofs in the meantime.
+	bucket := func(n *node) int {
+		if c.cfg.TargetLoss == 0 {
+			return 0
+		}
+		return int(c.failProb(n) * 50)
+	}
 	slices.SortFunc(cands, func(a, b *node) int {
 		if preferBridge && a.entry.Bridge != b.entry.Bridge {
 			if a.entry.Bridge {
@@ -423,7 +468,7 @@ func (c *Coordinator) pickNodes(n int, excludeOwners map[string]bool, preferBrid
 			}
 			return 1
 		}
-		return cmp.Or(cmp.Compare(len(a.shards), len(b.shards)), cmp.Compare(a.entry.ID, b.entry.ID))
+		return cmp.Or(cmp.Compare(bucket(a), bucket(b)), cmp.Compare(len(a.shards), len(b.shards)), cmp.Compare(a.entry.ID, b.entry.ID))
 	})
 	var out []*node
 	owners := map[string]bool{}
@@ -452,6 +497,36 @@ func (c *Coordinator) onlineBridge(now time.Time) *node {
 	slices.SortFunc(bridges, func(a, b *node) int { return cmp.Compare(a.entry.ID, b.entry.ID) })
 	c.bridgeRR++
 	return bridges[c.bridgeRR%len(bridges)]
+}
+
+func (c *Coordinator) score(owner string) *reliability.Score {
+	s := c.scores[owner]
+	if s == nil {
+		s = &reliability.Score{}
+		c.scores[owner] = s
+	}
+	return s
+}
+
+func (c *Coordinator) failProb(n *node) float64 {
+	return c.cfg.Reliability.FailProb(*c.score(n.entry.Owner))
+}
+
+func (c *Coordinator) targetLoss(s catalog.Segment) float64 {
+	if anchored(s) {
+		return c.cfg.AnchoredTargetLoss
+	}
+	return c.cfg.TargetLoss
+}
+
+// lossOf estimates the chance a segment held by these nodes (one per owner)
+// becomes unrecoverable.
+func (c *Coordinator) lossOf(holders []*node) float64 {
+	q := make([]float64, len(holders))
+	for i, n := range holders {
+		q[i] = c.failProb(n)
+	}
+	return reliability.LossProb(q, c.cfg.Params.K)
 }
 
 func location(n *node, idx int) proto.Location {
@@ -488,6 +563,7 @@ func (c *Coordinator) Tick() {
 			c.schedule(s, h[s.ID], now, &budget)
 		}
 		c.collectGarbage(now)
+		c.saveScores(now)
 		for id, u := range c.uploads {
 			if now.After(u.expires) {
 				delete(c.uploads, id)
@@ -529,6 +605,11 @@ func (c *Coordinator) schedule(s catalog.Segment, byIdx map[int][]string, now ti
 		}
 	}
 
+	if c.cfg.TargetLoss > 0 {
+		c.scheduleByLoss(s, si, byIdx, alive, online, owners, now, hotBudget)
+		return
+	}
+
 	base, k := c.base(s), c.cfg.Params.K
 	extra := min(c.extra(s, now), max(*hotBudget, 0), c.cfg.Params.MaxN-base)
 	*hotBudget -= extra
@@ -550,6 +631,94 @@ func (c *Coordinator) schedule(s catalog.Segment, byIdx map[int][]string, now ti
 		c.repair(s, si, alive, online, owners, target-len(alive), extra > 0, now)
 	case len(alive) > target+c.cfg.ShrinkSlack:
 		c.shrink(s, byIdx, len(alive)-target)
+	}
+	c.dropDuplicates(s, byIdx, now)
+}
+
+// scheduleByLoss sizes a segment by its estimated loss probability. Repair
+// adds holders until the estimate is under target; shrinking drops the least
+// reliable holders while it stays well under. Heat adds capacity on top, as
+// in the fixed-floor mode.
+func (c *Coordinator) scheduleByLoss(s catalog.Segment, si *segInfo, byIdx map[int][]string, alive map[int]bool, online []proto.Location, owners map[string]bool, now time.Time, hotBudget *int) {
+	k, maxN := c.cfg.Params.K, c.cfg.Params.MaxN
+	holderOf := map[int]*node{}
+	var holders []*node
+	for idx, ids := range byIdx {
+		n := c.nodes[ids[0]]
+		for _, id := range ids[1:] { // with duplicates, rate the better copy
+			if c.failProb(c.nodes[id]) < c.failProb(n) {
+				n = c.nodes[id]
+			}
+		}
+		holderOf[idx] = n
+		holders = append(holders, n)
+	}
+	target := c.targetLoss(s)
+	extra := min(c.extra(s, now), max(*hotBudget, 0))
+	*hotBudget -= extra
+	bridgeCanRebuild := s.Source != nil && s.Swarm != catalog.SwarmDead && c.onlineBridge(now) != nil
+
+	// How many more holders would bring the estimate under target, picking
+	// the candidates placement would actually choose.
+	need := func(base []*node, excl map[string]bool) int {
+		cands := c.pickNodes(maxN, excl, false, now)
+		cur := slices.Clone(base)
+		added := 0
+		for (len(cur) < c.cfg.MinN || c.lossOf(cur) > target) && added < len(cands) && len(cur) < maxN {
+			cur = append(cur, cands[added])
+			added++
+		}
+		return added
+	}
+
+	switch {
+	case len(online) < k && bridgeCanRebuild:
+		have := map[int]bool{}
+		var onl []*node
+		for _, l := range online {
+			have[l.Index] = true
+			onl = append(onl, c.nodes[l.NodeID])
+		}
+		if n := need(onl, owners) + extra; n > 0 {
+			c.repair(s, si, have, online, owners, n, extra > 0, now)
+		}
+	case len(holders) < c.cfg.MinN || c.lossOf(holders) > target:
+		if n := need(holders, owners); n > 0 {
+			c.repair(s, si, alive, online, owners, n+extra, extra > 0, now)
+		}
+	case extra > 0 && len(holders) < min(maxN, c.cfg.MinN+extra):
+		c.repair(s, si, alive, online, owners, min(maxN, c.cfg.MinN+extra)-len(holders), true, now)
+	case extra == 0 && len(holders) > c.cfg.MinN:
+		// Drop the least reliable holders while safely under target. Shard
+		// indices go with their holders here, not highest-index-first.
+		idxs := make([]int, 0, len(holderOf))
+		for idx := range holderOf {
+			idxs = append(idxs, idx)
+		}
+		slices.SortFunc(idxs, func(a, b int) int {
+			return cmp.Or(cmp.Compare(c.failProb(holderOf[b]), c.failProb(holderOf[a])), cmp.Compare(b, a))
+		})
+		keep := slices.Clone(holders)
+		var drop []int
+		for _, idx := range idxs {
+			if len(keep) <= c.cfg.MinN {
+				break
+			}
+			rest := slices.DeleteFunc(slices.Clone(keep), func(n *node) bool { return n == holderOf[idx] })
+			if c.lossOf(rest) > target/c.cfg.ShrinkMargin {
+				break
+			}
+			keep, drop = rest, append(drop, idx)
+		}
+		for _, idx := range drop {
+			for _, id := range byIdx[idx] {
+				c.deleteShard(c.nodes[id], proto.ShardKey{Segment: s.ID, Index: idx, Root: s.ShardRoot})
+			}
+			delete(byIdx, idx)
+		}
+		if len(drop) > 0 {
+			c.cfg.Logf("segment %.12s [%s]: shrank by %d shards (loss %.1e)", s.ID, class(s), len(drop), c.lossOf(keep))
+		}
 	}
 	c.dropDuplicates(s, byIdx, now)
 }
@@ -778,6 +947,7 @@ func (c *Coordinator) challenge(ch challenge) {
 		return
 	}
 	if ok {
+		c.cfg.Reliability.Proof(c.score(n.entry.Owner), true, time.Now())
 		if _, held := n.shards[ch.key]; held {
 			n.shards[ch.key] = credited
 		}
@@ -786,6 +956,7 @@ func (c *Coordinator) challenge(ch challenge) {
 	if reason == "" {
 		return // unreachable: heartbeats and grace periods handle that
 	}
+	c.cfg.Reliability.Proof(c.score(n.entry.Owner), false, time.Now())
 	delete(n.shards, ch.key)
 	n.strikes++
 	c.cfg.Logf("node %s failed storage proof for %.12s/%d: %s (strike %d)", ch.nodeID, ch.key.Segment, ch.key.Index, reason, n.strikes)
@@ -846,6 +1017,7 @@ func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, _ *http.Request, p 
 		c.nodes[p.Node.ID] = n
 		c.cfg.Logf("node %s joined (owner %s, %s, bridge=%v)", p.Node.ID, p.Node.Owner, req.Node.Addr, p.Node.Bridge)
 	}
+	c.cfg.Reliability.Heartbeat(c.score(p.Node.Owner), n.lastSeen, now)
 	n.entry, n.addr, n.lastSeen, n.head = *p.Node, req.Node.Addr, now, req.Head
 
 	// Reconcile the inventory. Shards no longer reported are gone. New ones
@@ -1187,6 +1359,7 @@ func (c *Coordinator) Status() proto.StatusResponse {
 		out.Nodes = append(out.Nodes, proto.NodeStatus{
 			ID: n.entry.ID, Owner: n.entry.Owner, Addr: n.addr, Bridge: n.entry.Bridge,
 			Online: c.online(n, now), Shards: len(n.shards), Strikes: n.strikes, LastSeen: n.lastSeen,
+			FailProb: c.failProb(n),
 		})
 	}
 	for _, s := range c.cat.LiveSegments() {
@@ -1196,10 +1369,16 @@ func (c *Coordinator) Status() proto.StatusResponse {
 			Target:  min(c.base(s)+c.extra(s, now), c.cfg.Params.MaxN),
 			Durable: len(h[s.ID]), HeatPerMin: c.heat(si, now) * 60, Repairing: si.pending != nil,
 		}
+		var holders []*node
 		for _, ids := range h[s.ID] {
+			holders = append(holders, c.nodes[ids[0]])
 			if slices.ContainsFunc(ids, func(id string) bool { return c.online(c.nodes[id], now) }) {
 				st.Online++
 			}
+		}
+		st.LossProb = c.lossOf(holders)
+		if c.cfg.TargetLoss > 0 {
+			st.Target = 0 // no fixed target: sized by loss
 		}
 		out.Segments = append(out.Segments, st)
 	}
@@ -1210,4 +1389,40 @@ func (c *Coordinator) Status() proto.StatusResponse {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// --- reliability persistence ----------------------------------------------
+
+// Scores are soft state, but losing them would reset every owner to the new-
+// owner prior and trigger a pool-wide repair storm, so they're saved.
+func (c *Coordinator) loadScores() error {
+	if c.cfg.ScoresPath == "" {
+		return nil
+	}
+	b, err := os.ReadFile(c.cfg.ScoresPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, &c.scores)
+}
+
+func (c *Coordinator) saveScores(now time.Time) {
+	if c.cfg.ScoresPath == "" || now.Sub(c.scoresSaved) < time.Minute {
+		return
+	}
+	b, err := json.Marshal(c.scores)
+	if err == nil {
+		tmp := c.cfg.ScoresPath + ".tmp"
+		if err = os.WriteFile(tmp, b, 0o600); err == nil {
+			err = os.Rename(tmp, c.cfg.ScoresPath)
+		}
+	}
+	if err != nil {
+		c.cfg.Logf("save scores: %v", err)
+		return
+	}
+	c.scoresSaved = now
 }

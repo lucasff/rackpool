@@ -21,6 +21,10 @@ func main() {
 	flag.IntVar(&cfg.Params.MaxN, "max-n", cfg.Params.MaxN, "total shard indices per segment (cap for hot expansion)")
 	flag.IntVar(&cfg.AnchoredN, "anchored-n", cfg.AnchoredN, "shards for segments with a verified external swarm")
 	flag.IntVar(&cfg.OrphanN, "orphan-n", cfg.OrphanN, "shards for segments without one")
+	flag.Float64Var(&cfg.TargetLoss, "target-loss", cfg.TargetLoss, "size segments by estimated loss probability from holder reliability (0 = fixed floors)")
+	flag.Float64Var(&cfg.AnchoredTargetLoss, "anchored-target-loss", cfg.AnchoredTargetLoss, "loss target for segments backed by a verified swarm")
+	flag.IntVar(&cfg.MinN, "min-n", cfg.MinN, "fewest shards a segment may have in loss-target mode")
+	flag.StringVar(&cfg.ScoresPath, "scores", "scores.json", "reliability scores file")
 	flag.IntVar(&cfg.RepairSlack, "repair-slack", cfg.RepairSlack, "repair once this many shards below the floor")
 	flag.Float64Var(&cfg.HotReadsPerShard, "hot-reads-per-shard", cfg.HotReadsPerShard, "reads/min that earn one extra shard")
 	flag.DurationVar(&cfg.OfflineAfter, "offline-after", cfg.OfflineAfter, "heartbeat silence before a node stops serving reads")
@@ -30,6 +34,7 @@ func main() {
 	flag.DurationVar(&cfg.TickEvery, "tick", cfg.TickEvery, "scheduler interval")
 	flag.Parse()
 	cfg.Logf = log.Printf
+	cfg.Reliability.OfflineAfter = cfg.OfflineAfter
 
 	pool, err := auth.LoadPool(*poolPath)
 	if err != nil {

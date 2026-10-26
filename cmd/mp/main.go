@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -193,13 +194,17 @@ func status(ctx context.Context, coordURL string, id *auth.Identity) error {
 	if st.WriteBlocked != "" {
 		fmt.Fprintf(tw, " (WRITES BLOCKED: %s)", st.WriteBlocked)
 	}
-	fmt.Fprintf(tw, "\n\nNODE\tOWNER\tONLINE\tBRIDGE\tSHARDS\tSTRIKES\n")
+	fmt.Fprintf(tw, "\n\nNODE\tOWNER\tONLINE\tBRIDGE\tSHARDS\tSTRIKES\tFAIL-P\n")
 	for _, n := range st.Nodes {
-		fmt.Fprintf(tw, "%s\t%s\t%v\t%v\t%d\t%d\n", n.ID, n.Owner, n.Online, n.Bridge, n.Shards, n.Strikes)
+		fmt.Fprintf(tw, "%s\t%s\t%v\t%v\t%d\t%d\t%.3f\n", n.ID, n.Owner, n.Online, n.Bridge, n.Shards, n.Strikes, n.FailProb)
 	}
-	fmt.Fprintf(tw, "\nSEGMENT\tCLASS\tREFS\tONLINE/DURABLE/TARGET\tHEAT(reads/min)\tREPAIRING\n")
+	fmt.Fprintf(tw, "\nSEGMENT\tCLASS\tREFS\tONLINE/DURABLE/TARGET\tLOSS-P\tHEAT(reads/min)\tREPAIRING\n")
 	for _, s := range st.Segments {
-		fmt.Fprintf(tw, "%.12s\t%s\t%d\t%d/%d/%d\t%.1f\t%v\n", s.ID, s.Class, s.Refs, s.Online, s.Durable, s.Target, s.HeatPerMin, s.Repairing)
+		target := strconv.Itoa(s.Target)
+		if s.Target == 0 {
+			target = "auto"
+		}
+		fmt.Fprintf(tw, "%.12s\t%s\t%d\t%d/%d/%s\t%.1e\t%.1f\t%v\n", s.ID, s.Class, s.Refs, s.Online, s.Durable, target, s.LossProb, s.HeatPerMin, s.Repairing)
 	}
 	return tw.Flush()
 }
