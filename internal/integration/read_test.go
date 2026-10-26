@@ -13,7 +13,7 @@ import (
 
 // Range reads return exactly the right bytes at arbitrary offsets, across
 // chunk, shard and segment boundaries (8 MiB segments, k=4: 2 MiB shards of
-// two 1 MiB chunks each).
+// eight chunks each).
 func TestRangeReads(t *testing.T) {
 	c := newCluster(t, 12, func(cfg *coord.Config) {
 		cfg.SegmentSize = 8 << 20
@@ -71,5 +71,32 @@ func TestRangeReadFallsBackToParity(t *testing.T) {
 	c.heartbeat()
 	if got := c.readBack(c.client, "/x.mkv"); !bytes.Equal(got, data) {
 		t.Fatal("fallback read mismatch")
+	}
+}
+
+// Sequential reading prefetches one segment ahead all the way through, so
+// every segment is already loading when the reader reaches it.
+func TestSequentialReadPrefetchesEverySegment(t *testing.T) {
+	c := newCluster(t, 12, func(cfg *coord.Config) {
+		cfg.OfflineAfter, cfg.DownAfter = 10*time.Second, time.Minute
+	})
+	data := randomFile(t, 640<<10) // ten 64 KiB segments
+	if _, err := c.client.Add(c.ctx, bytes.NewReader(data), "/s.mkv", nil); err != nil {
+		t.Fatal(err)
+	}
+	m, _ := c.client.Stat(c.ctx, "/s.mkv")
+	f := c.client.Open(c.ctx, m)
+	defer f.Close()
+	buf := make([]byte, 16<<10)
+	for off := int64(0); off < int64(len(data)); off += int64(len(buf)) {
+		if _, err := f.ReadAt(buf, off); err != nil && err != io.EOF {
+			t.Fatal(err)
+		}
+		if seg := int(off / (64 << 10)); seg+1 < len(m.Segments) && off%(64<<10) == 48<<10 {
+			// Three quarters into a segment, the next must already be loading.
+			if !f.Loading(seg + 1) {
+				t.Fatalf("segment %d not prefetched while reading segment %d", seg+1, seg)
+			}
+		}
 	}
 }

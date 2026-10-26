@@ -36,6 +36,7 @@ type File struct {
 
 	mu   sync.Mutex
 	segs map[int]*segLoad
+	cur  int // segment most recently read
 }
 
 type segLoad struct {
@@ -44,6 +45,7 @@ type segLoad struct {
 	setup  chan struct{} // closed once the fields below are set
 
 	err       error
+	firstDone chan struct{} // closed once the first requested chunk has arrived
 	l         located
 	shardSize int
 	perShard  int // chunks per shard
@@ -85,13 +87,16 @@ func (f *File) segmentAt(off int64) (idx int, start int64) {
 func (f *File) load(i int, o int64) *segLoad {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.cur = i
 	l := f.segs[i]
 	if l == nil {
 		l = f.start(i, o)
 		f.segs[i] = l
 	}
-	if i+1 < len(f.m.Segments) && f.segs[i+1] == nil {
-		f.segs[i+1] = f.start(i+1, 0)
+	select {
+	case <-l.firstDone:
+		f.prefetchLocked(i)
+	default: // prefetched when its first chunk arrives (see afterFirst)
 	}
 	for k, x := range f.segs {
 		if k < i-1 || k > i+1 {
@@ -102,14 +107,33 @@ func (f *File) load(i int, o int64) *segLoad {
 	return l
 }
 
+// prefetchLocked starts the segment after i, keeping exactly one segment of
+// read-ahead. Caller holds f.mu.
+func (f *File) prefetchLocked(i int) {
+	if i+1 < len(f.m.Segments) && f.segs[i+1] == nil {
+		f.segs[i+1] = f.start(i+1, 0)
+	}
+}
+
+// afterFirst runs when segment i's first chunk has arrived. If the reader
+// is in that segment, the next one is prefetched now: starting it earlier
+// would compete with the chunk being waited for.
+func (f *File) afterFirst(i int, l *segLoad) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.segs[i] == l && f.cur == i {
+		f.prefetchLocked(i)
+	}
+}
+
 func (f *File) start(i int, first int64) *segLoad {
 	ctx, cancel := context.WithCancel(f.ctx)
-	l := &segLoad{entry: f.m.Segments[i], cancel: cancel, setup: make(chan struct{})}
-	go l.run(ctx, f.c, first)
+	l := &segLoad{entry: f.m.Segments[i], cancel: cancel, setup: make(chan struct{}), firstDone: make(chan struct{})}
+	go l.run(ctx, f.c, first, func() { f.afterFirst(i, l) })
 	return l
 }
 
-func (l *segLoad) run(ctx context.Context, c *Client, first int64) {
+func (l *segLoad) run(ctx context.Context, c *Client, first int64, afterFirst func()) {
 	loc, err := c.locate(ctx, l.entry.ID)
 	if err == nil && int64(codec.PlainSize(loc.seg.CipherSize)) != l.entry.PlainSize {
 		err = fmt.Errorf("segment %.12s: size in manifest doesn't match the catalog", l.entry.ID)
@@ -117,6 +141,7 @@ func (l *segLoad) run(ctx context.Context, c *Client, first int64) {
 	if err != nil {
 		l.err = err
 		close(l.setup)
+		close(l.firstDone)
 		return
 	}
 	p := loc.loc.Params
@@ -140,15 +165,29 @@ func (l *segLoad) run(ctx context.Context, c *Client, first int64) {
 			holders[s.Index] = append(holders[s.Index], s)
 		}
 	}
-	// The chunk being read first, then onward from there, then the rest.
+	// First the chunk the reader is waiting for, alone, so it gets its
+	// holder's whole upload.
 	g0 := l.chunkFor(first)
+	if !l.isReady(g0) && !l.fetch(ctx, c, g0, holders) {
+		l.fallback(ctx, c)
+		close(l.firstDone)
+		afterFirst()
+		return
+	}
+	close(l.firstDone)
+	afterFirst()
+	// Then the rest, round-robin across the data shards starting where the
+	// reader is, so every holder is busy at once and throughput adds up.
 	queue := make(chan int, total)
-	for n := range total {
-		queue <- (g0 + n) % total
+	d0, c0 := g0/l.perShard, g0%l.perShard
+	for step := range l.perShard {
+		for dd := range p.K {
+			queue <- ((d0+dd)%p.K)*l.perShard + (c0+step)%l.perShard
+		}
 	}
 	close(queue)
 	var wg sync.WaitGroup
-	for range min(2*p.K, total) {
+	for range min(3*p.K, total) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -324,4 +363,11 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 	}
 	f.off = offset
 	return offset, nil
+}
+
+// Loading reports whether segment i is loaded or loading (for tests).
+func (f *File) Loading(i int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.segs[i] != nil
 }

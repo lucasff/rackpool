@@ -12,7 +12,10 @@ import (
 // proof costs one chunk plus log2 hashes instead of the whole shard. A
 // segment's shard hashes form a second tree whose root is the only thing the
 // catalog stores per segment.
-const ChunkSize = 1 << 20
+//
+// Chunks are also the unit of range reads, so they're kept small: over a
+// 10 Mbit/s home uplink a 256 KiB chunk arrives in about 0.2 s.
+const ChunkSize = 256 << 10
 
 // ShardSize is the length of every shard of a segment, as the erasure coder
 // splits it.
