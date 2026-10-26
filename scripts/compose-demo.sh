@@ -9,6 +9,10 @@ docker compose -f docker-compose.pool.yml down -v --remove-orphans >/dev/null 2>
 # A new directory per run: Docker Desktop on macOS can keep stale entries for
 # bind-mounted paths that were deleted while in use, so paths aren't reused.
 export L="local/run-$(date +%s)"
+# On Linux, bind mounts keep host ownership, so the services must run as the
+# host user to read the keys and write their data. Docker Desktop (macOS)
+# maps ownership itself and keeps using the image's default user.
+[ "$(uname -s)" = Linux ] && export MP_UID="$(id -u)"
 mkdir -p "$L"/{coord,node1,node2,node3,node4,node5,bridge,swarm/abc123,host}
 docker build -q -t mediapool:latest .. >/dev/null
 

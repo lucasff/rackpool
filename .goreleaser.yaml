@@ -1,0 +1,61 @@
+# Release builds for tags v*; driven by .github/workflows/release.yml.
+version: 2
+
+project_name: mediapool
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: mp
+    main: ./cmd/mp
+    binary: mp
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+  - id: mp-coord
+    main: ./cmd/mp-coord
+    binary: mp-coord
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+  - id: mp-node
+    main: ./cmd/mp-node
+    binary: mp-node
+    env: [CGO_ENABLED=0]
+    # internal/diskfree uses golang.org/x/sys/unix (Statfs), which has no
+    # Windows implementation, so mp-node is not built for Windows.
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w"]
+
+archives:
+  - id: default
+    ids: [mp, mp-coord, mp-node]
+    formats: [tar.gz]
+    # mp-node has no Windows build, so Windows archives hold two binaries.
+    allow_different_binary_count: true
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  prerelease: auto

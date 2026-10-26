@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  STATICCHECK_VERSION: v0.8.2 # honnef.co/go/tools, i.e. staticcheck 2026.2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION} ./...
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build all binaries
+        run: go build -trimpath -o bin/ ./cmd/...
+      - name: go vet
+        run: go vet ./...
+      # The integration tests are timing-sensitive: always -race, and no extra
+      # package parallelism beyond Go's defaults.
+      - name: go test -race
+        run: go test -race -timeout 10m ./... 2>&1 | tee test-output.txt
+      - name: Upload test output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-output-${{ matrix.os }}
+          path: test-output.txt
+          if-no-files-found: ignore
+
+  demo:
+    name: End-to-end demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # demo.sh needs xxd, curl, cmp and mktemp; the runner image normally has
+      # them all, but xxd ships with vim-common, so install it if missing.
+      - name: Ensure demo dependencies
+        run: |
+          command -v xxd >/dev/null || { sudo apt-get update && sudo apt-get install -y xxd; }
+          for c in xxd curl cmp mktemp; do command -v "$c"; done
+      # demo.sh does not fail when a read-back differs (the comparison is only
+      # guarded by an if), so assert on its success lines.
+      - name: Run scripts/demo.sh
+        run: |
+          bash scripts/demo.sh 2>&1 | tee demo-output.txt
+          grep -qx 'OK: identical' demo-output.txt
+          grep -qx 'OK: identical after coordinator recovery' demo-output.txt
+      - name: Upload demo output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: demo-output
+          path: demo-output.txt
+          if-no-files-found: ignore
+
+  # rclone/ will become a separate Go module; its jobs run only once it exists.
+  detect-rclone:
+    name: Detect rclone module
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      present: ${{ steps.check.outputs.present }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: check
+        run: |
+          if [ -f rclone/go.mod ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+
+  rclone:
+    name: rclone module
+    needs: detect-rclone
+    if: needs.detect-rclone.outputs.present == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: rclone
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: rclone/go.mod
+          cache-dependency-path: rclone/go.sum
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -timeout 10m ./...
+      - name: go build
+        run: go build ./...
