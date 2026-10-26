@@ -5,6 +5,7 @@ services:
   coord:
     image: mediapool:latest
     entrypoint: ["mp-coord"]
+    user: "${MP_UID:-10001}"
     volumes: ["./${L}/coord:/data", "./${L}/pool.json:/config/pool.json:ro"]
     environment:
       MP_LISTEN: ":7000"
@@ -28,6 +29,7 @@ services:
 
   node1: &node
     image: mediapool:latest
+    user: "${MP_UID:-10001}"
     depends_on: { coord: { condition: service_healthy } }
     volumes: ["./${L}/node1:/data", "./${L}/pool.json:/config/pool.json:ro"]
     environment: &nodeenv
