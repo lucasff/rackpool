@@ -63,6 +63,13 @@ jobs:
       # package parallelism beyond Go's defaults.
       - name: go test -race
         run: go test -race -timeout 10m ./... 2>&1 | tee test-output.txt
+      # Surface the failing lines as an annotation, readable without the logs.
+      - name: Summarize failures
+        if: failure()
+        run: |
+          lines=$(grep -E -- '--- FAIL|^FAIL|panic:|DATA RACE|_test\.go:[0-9]+:' test-output.txt | head -40 || true)
+          lines=${lines//'%'/'%25'}
+          echo "::error title=go test failures::${lines//$'\n'/'%0A'}"
       - name: Upload test output
         if: failure()
         uses: actions/upload-artifact@v7

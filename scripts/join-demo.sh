@@ -42,7 +42,7 @@ grep -h "joined the pool" "$W/nodes.log" | sed -E 's/^[0-9\/ :]+//'
 
 echo "== a fifth person joins with the CLI only"
 env_of "$W/founder/mediapool.env" bin/mp invite create --name frank 2>/dev/null >"$W/frank.invite"
-bin/mp join "$(cat "$W/frank.invite")" --dir "$W/frank" | head -1
+bin/mp join "$(cat "$W/frank.invite")" --dir "$W/frank" | sed -n 1p
 
 echo "== members"
 env_of "$W/founder/mediapool.env" bin/mp member list

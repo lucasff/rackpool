@@ -62,8 +62,8 @@ mp alice status | sed -n '/SEGMENT/,$p'
 echo "== streaming over HTTP with a range request"
 bin/mp --pool "$W/pool.json" --key "$W/alice.key" --member alice serve http --addr 127.0.0.1:8080 >/dev/null 2>&1 & pids+=($!)
 sleep 1
-curl -s -r 1000000-1000015 http://127.0.0.1:8080/tv/Show/S01E01.mkv | xxd | head -1
-dd if="$W/swarm/abc123/Show.S01E01.mkv" bs=1 skip=1000000 count=16 2>/dev/null | xxd | head -1
+curl -s -r 1000000-1000015 http://127.0.0.1:8080/tv/Show/S01E01.mkv | xxd | sed -n 1p
+dd if="$W/swarm/abc123/Show.S01E01.mkv" bs=1 skip=1000000 count=16 2>/dev/null | xxd | sed -n 1p
 
 if [ "${KEEP:-}" = 1 ]; then
   mp alice copy "$W/swarm" pool:/library >/dev/null
@@ -83,7 +83,7 @@ echo "== coordinator loses its disk and restarts without -fresh"
 kill $COORD; wait $COORD 2>/dev/null || true
 bin/mp-coord "${COORD_FLAGS[@]}" -catalog "$W/catalog-new.log" 2>>"$W/coord.log" & pids+=($!)
 sleep 4
-mp alice status | head -1
+mp alice status | sed -n 1p
 if cmp <(mp alice cat /tv/Show/S01E01.mkv) "$W/swarm/abc123/Show.S01E01.mkv"; then echo "OK: identical after coordinator recovery"; fi
 
 echo "== both members remove the file; shards are garbage-collected"
