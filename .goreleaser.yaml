@@ -66,12 +66,12 @@ checksum:
   algorithm: sha256
 
 changelog:
-  sort: asc
+  abbrev: 7 # commit order, short hashes
   filters:
     exclude:
       - "^docs:"
       - "^test:"
-      - "^Merge pull request"
+      - "^Merge (pull request|branch)"
       - "^Initial commit$"
   # Groups are matched in order, so "Changes" spells out "not starting
   # with Bump" (Go regexps have no lookahead) to list it above Dependencies.
