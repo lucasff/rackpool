@@ -15,7 +15,7 @@ builds:
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
     flags: [-trimpath]
-    ldflags: ["-s -w"]
+    ldflags: ["-s -w -X main.version={{ .Version }}"]
   - id: mp-coord
     main: ./cmd/mp-coord
     binary: mp-coord
@@ -23,10 +23,21 @@ builds:
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
     flags: [-trimpath]
-    ldflags: ["-s -w"]
+    ldflags: ["-s -w -X main.version={{ .Version }}"]
   - id: mp-node
     main: ./cmd/mp-node
     binary: mp-node
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{ .Version }}"]
+
+  # rclone with the mediapool backend; a separate module, so built from rclone/.
+  - id: rclone-mediapool
+    dir: rclone
+    main: ./cmd/rclone-mediapool
+    binary: rclone-mediapool
     env: [CGO_ENABLED=0]
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
@@ -41,6 +52,14 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
+    files: [README.md]
+  - id: rclone
+    ids: [rclone-mediapool]
+    formats: [tar.gz]
+    name_template: "rclone-mediapool_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
 
 checksum:
   name_template: checksums.txt
@@ -52,6 +71,32 @@ changelog:
     exclude:
       - "^docs:"
       - "^test:"
+      - "^Merge pull request"
+      - "^Initial commit$"
+  # Groups are matched in order, so "Changes" spells out "not starting
+  # with Bump" (Go regexps have no lookahead) to list it above Dependencies.
+  groups:
+    - title: Changes
+      regexp: "^([^B]|B[^u]|Bu[^m]|Bum[^p]|Bump[^ ])"
+      order: 0
+    - title: Dependencies
+      regexp: "^Bump "
+      order: 1
 
 release:
+  name_template: "rackpool {{ .Tag }}"
   prerelease: auto
+  header: |
+    ## Install
+
+    **Docker** (mp-node by default; `mp-coord` and `mp` are in the same image):
+
+    ```sh
+    docker pull ghcr.io/lucasff/rackpool:{{ .Version }}
+    ```
+
+    **Binaries:** download the archive for your platform below. `mediapool_*`
+    holds `mp`, `mp-coord` and `mp-node`; `rclone-mediapool_*` is rclone with
+    the mediapool backend. Verify with `sha256sum -c checksums.txt`.
+  footer: |
+    **Full changelog:** https://github.com/lucasff/rackpool/compare/{{ .PreviousTag }}...{{ .Tag }}

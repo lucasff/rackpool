@@ -4,3 +4,4 @@ coord-state.json
 catalog*.log
 deploy/local/
 dist/
+notes/

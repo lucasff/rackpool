@@ -4,9 +4,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/...
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/ ./cmd/...
 
 FROM alpine:3.24
+LABEL org.opencontainers.image.title="rackpool" \
+      org.opencontainers.image.description="Encrypted, erasure-coded shared media pool: mp-node (default), mp-coord and the mp CLI" \
+      org.opencontainers.image.source="https://github.com/lucasff/rackpool"
 RUN apk add --no-cache ca-certificates wget \
  && adduser -D -u 10001 mediapool \
  && mkdir -p /data /config && chown mediapool /data

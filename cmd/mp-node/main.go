@@ -31,6 +31,9 @@ import (
 	"mediapool/internal/vfs"
 )
 
+// version is set at release time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	var cfg node.Config
 	var quota, reserve limits.Bytes
@@ -64,8 +67,13 @@ func main() {
 	rcMember := flag.String("rc-member", "", "also show the library in the web UI, as this member (needs -rc-member-key and MEDIAPOOL_SECRET)")
 	rcMemberKey := flag.String("rc-member-key", "", "that member's private key file")
 	pubkey := flag.Bool("print-pubkey", false, "print this node's public key (creating the key if needed) and exit")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	if err := envflag.Parse(flag.CommandLine, os.Args[1:]); err != nil {
 		log.Fatal(err)
+	}
+	if *showVersion {
+		fmt.Println(version)
+		return
 	}
 	cfg.Logf = log.Printf
 	cfg.Quota, cfg.Reserve = int64(quota), int64(reserve)

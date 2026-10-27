@@ -15,6 +15,9 @@ import (
 	"mediapool/internal/relay"
 )
 
+// version is set at release time with -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	cfg := coord.DefaultConfig()
 	listen := flag.String("listen", ":7000", "listen address")
@@ -43,8 +46,13 @@ func main() {
 	var relayLimit limits.Rate
 	flag.Var(&relayLimit, "relay-limit", "bandwidth cap per relayed node, e.g. 20M for 20 Mbit/s (0 = unlimited)")
 	pubkey := flag.Bool("print-pubkey", false, "print the coordinator's public key (creating the key if needed) and exit")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	if err := envflag.Parse(flag.CommandLine, os.Args[1:]); err != nil {
 		log.Fatal(err)
+	}
+	if *showVersion {
+		fmt.Println(version)
+		return
 	}
 	cfg.Logf = log.Printf
 	cfg.SegmentSize = int(seg)

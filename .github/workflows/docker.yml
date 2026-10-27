@@ -15,6 +15,7 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
+  DESCRIPTION: "Encrypted, erasure-coded shared media pool: mp-node (default), mp-coord and the mp CLI"
 
 jobs:
   image:
@@ -48,6 +49,16 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
+          # Multi-arch images show the index annotation on the package page;
+          # the label covers single-arch pulls and `docker inspect`.
+          labels: |
+            org.opencontainers.image.title=rackpool
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+          annotations: |
+            org.opencontainers.image.title=rackpool
+            org.opencontainers.image.description=${{ env.DESCRIPTION }}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
       - name: Build${{ github.event_name != 'pull_request' && ' and push' || '' }}
         uses: docker/build-push-action@v7
         with:
@@ -56,6 +67,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
