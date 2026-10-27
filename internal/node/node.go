@@ -364,6 +364,7 @@ func (n *Node) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/proof/{seg}/{idx}", n.handleProof)
 	mux.HandleFunc("GET /v1/ping", n.handlePing)
 	mux.HandleFunc("GET /v1/chunk/{seg}/{idx}", n.authed(n.handleChunk))
+	mux.HandleFunc("GET /v1/chunks/{seg}/{idx}", n.authed(n.handleChunks))
 	mux.HandleFunc("GET /v1/log", n.authed(n.cat.ServeLog))
 	return mux
 }
@@ -599,6 +600,48 @@ func (n *Node) handleChunk(w http.ResponseWriter, r *http.Request) {
 	h.Set(transfer.ChunkProofHeader, codec.EncodeProof(cp))
 	h.Set("Content-Length", strconv.Itoa(len(c)))
 	_, _ = limits.Writer{Ctx: r.Context(), W: w, B: n.up}.Write(c)
+}
+
+// handleChunks streams a run of consecutive chunks [from, to) of a shard in
+// one response, with every chunk's proof in a header, so a sequential
+// reader pays one round trip per shard instead of one per chunk.
+func (n *Node) handleChunks(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	k, err := parseKey(r, q.Get("root"))
+	from, ferr := strconv.Atoi(q.Get("from"))
+	to, terr := strconv.Atoi(q.Get("to"))
+	if err != nil || ferr != nil || terr != nil || from < 0 || to <= from || to-from > transfer.MaxChunkRun {
+		http.Error(w, "bad chunk range", http.StatusBadRequest)
+		return
+	}
+	data, segProof, err := n.readShard(k)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	to = min(to, codec.NumChunks(len(data)))
+	if from >= to {
+		http.Error(w, "chunk range past the end of the shard", http.StatusBadRequest)
+		return
+	}
+	proofs := make([]string, 0, to-from)
+	for c := from; c < to; c++ {
+		_, cp, _ := codec.ChunkProof(data, c)
+		proofs = append(proofs, codec.EncodeProof(cp))
+	}
+	done, ok := n.slot(r)
+	if !ok {
+		http.Error(w, "busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer done()
+	h := w.Header()
+	h.Set(transfer.ShardHashHeader, codec.HashToHex(codec.ShardHash(data)))
+	h.Set(transfer.ProofHeader, segProof)
+	h.Set(transfer.ChunkProofHeader, strings.Join(proofs, ";"))
+	body := data[from*codec.ChunkSize : min(to*codec.ChunkSize, len(data))]
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	_, _ = limits.Writer{Ctx: r.Context(), W: w, B: n.up}.Write(body)
 }
 
 // handleProof answers a storage challenge: chunk c of a shard with Merkle

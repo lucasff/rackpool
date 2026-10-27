@@ -19,6 +19,7 @@ import (
 
 	"mediapool/internal/auth"
 	"mediapool/internal/client"
+	"mediapool/internal/limits"
 	"mediapool/internal/rc"
 	"mediapool/internal/stats"
 	"mediapool/internal/vfs"
@@ -31,6 +32,7 @@ var g struct {
 	verbose                           bool
 	dryRun                            bool
 	progress                          bool
+	readAhead, cacheSize              limits.Bytes
 }
 
 func main() {
@@ -55,6 +57,9 @@ func main() {
 	pf.BoolVarP(&g.verbose, "verbose", "v", false, "print more")
 	pf.BoolVarP(&g.dryRun, "dry-run", "n", false, "show what would change without changing anything")
 	pf.BoolVarP(&g.progress, "progress", "P", false, "show transfer progress")
+	g.readAhead, g.cacheSize = limits.Bytes(client.DefaultReadAhead), limits.Bytes(client.DefaultCacheSize)
+	pf.Var(&g.readAhead, "read-ahead", "how far past the segment being read to fetch in the background")
+	pf.Var(&g.cacheSize, "cache-size", "memory for segments, shared by all readers of a file")
 
 	root.AddCommand(lsCommands()...)
 	root.AddCommand(catCmd(), sizeCmd(), aboutCmd(), statusCmd())
@@ -113,6 +118,7 @@ func openFS() (*vfs.FS, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.ReadAhead, c.CacheSize = int64(g.readAhead), int64(g.cacheSize)
 	return vfs.New(c), nil
 }
 

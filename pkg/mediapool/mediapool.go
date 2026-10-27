@@ -31,6 +31,11 @@ type Config struct {
 	// CatalogPath keeps a local replica of the catalog between runs, so
 	// startup syncs only new entries. Empty keeps it in memory.
 	CatalogPath string
+	// ReadAhead is how many bytes past the segment being read to fetch in
+	// the background (default 32 MiB). CacheSize bounds the segments kept
+	// in memory, shared by every open file (default 256 MiB).
+	ReadAhead int64
+	CacheSize int64
 }
 
 type Client struct{ c *client.Client }
@@ -60,6 +65,12 @@ func Open(cfg Config) (*Client, error) {
 	c, err := client.New(cfg.CoordURL, []byte(cfg.Secret), cfg.Member, key, pool, cfg.CatalogPath)
 	if err != nil {
 		return nil, err
+	}
+	if cfg.ReadAhead > 0 {
+		c.ReadAhead = cfg.ReadAhead
+	}
+	if cfg.CacheSize > 0 {
+		c.CacheSize = cfg.CacheSize
 	}
 	return &Client{c: c}, nil
 }
@@ -104,11 +115,28 @@ type Reader interface {
 }
 
 func (c *Client) Open(ctx context.Context, path string) (Reader, error) {
+	return c.OpenRange(ctx, path, 0, -1)
+}
+
+// OpenRange opens a file for reading length bytes from offset (-1 for to
+// the end), positioned at offset. Read-ahead stops at the end of the range,
+// so bounded reads don't fetch data nobody asked for.
+func (c *Client) OpenRange(ctx context.Context, path string, offset, length int64) (Reader, error) {
 	m, err := c.c.Stat(ctx, path)
 	if err != nil {
 		return nil, err
 	}
-	return c.c.Open(ctx, m), nil
+	end := int64(-1)
+	if length >= 0 {
+		end = offset + length
+	}
+	f := c.c.OpenRange(ctx, m, end)
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
+	return f, nil
 }
 
 // Put stores r at path. Overwriting is only allowed for files this member

@@ -69,6 +69,16 @@ func init() {
 			Help:     "Local file to keep a replica of the pool catalog in between runs.\n\nWith it, startup syncs only new entries. Leave blank to keep it in memory.",
 			Advanced: true,
 		}, {
+			Name:     "read_ahead",
+			Help:     "How far past the segment being read to fetch in the background.",
+			Default:  fs.SizeSuffix(32 << 20),
+			Advanced: true,
+		}, {
+			Name:     "cache_size",
+			Help:     "Memory for segments shared by all open files.\n\nSeveral readers of one file (playback, a probe at the end, subtitle extraction) share it instead of cancelling each other's fetches.",
+			Default:  fs.SizeSuffix(256 << 20),
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -90,6 +100,8 @@ type Options struct {
 	KeyFile     string               `config:"key_file"`
 	Secret      string               `config:"secret"`
 	CatalogPath string               `config:"catalog_path"`
+	ReadAhead   fs.SizeSuffix        `config:"read_ahead"`
+	CacheSize   fs.SizeSuffix        `config:"cache_size"`
 	Enc         encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -140,6 +152,7 @@ func openClient(opt Options) (*mediapool.Client, error) {
 	c, err := mediapool.Open(mediapool.Config{
 		CoordURL: opt.CoordURL, PoolFile: opt.PoolFile, Member: opt.Member,
 		KeyFile: opt.KeyFile, Secret: secret, CatalogPath: opt.CatalogPath,
+		ReadAhead: int64(opt.ReadAhead), CacheSize: int64(opt.CacheSize),
 	})
 	if err != nil {
 		return nil, err
@@ -406,18 +419,12 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 			}
 		}
 	}
-	r, err := o.fs.client.Open(ctx, o.fs.abs(o.remote))
+	r, err := o.fs.client.OpenRange(ctx, o.fs.abs(o.remote), offset, limit)
 	if errors.Is(err, mediapool.ErrNotExist) {
 		return nil, fs.ErrorObjectNotFound
 	}
 	if err != nil {
 		return nil, err
-	}
-	if offset > 0 {
-		if _, err := r.Seek(offset, io.SeekStart); err != nil {
-			_ = r.Close()
-			return nil, err
-		}
 	}
 	if limit >= 0 {
 		return readers.NewLimitedReadCloser(r, limit), nil

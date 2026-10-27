@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 
 	"mediapool/internal/codec"
@@ -24,6 +25,59 @@ const (
 	ShardHashHeader  = "X-Shard-Hash"
 	ChunkProofHeader = "X-Chunk-Proof"
 )
+
+// MaxChunkRun is the most chunks one GetChunks request may ask for.
+const MaxChunkRun = 64
+
+// GetChunks fetches chunks [from, to) of shard idx in one request and
+// calls got for each as soon as it has arrived and verified, in order. It
+// returns the number of chunks delivered; on error the caller can retry
+// the rest elsewhere.
+func GetChunks(ctx context.Context, hc *http.Client, s Signer, addr, seg string, idx int, root merkle.Hash, maxN, shardSize, from, to int, got func(c int, data []byte)) (int, error) {
+	u := fmt.Sprintf("%s/v1/chunks/%s/%d?root=%s&from=%d&to=%d", addr, seg, idx, codec.HashToHex(root), from, to)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, err
+	}
+	if s != nil {
+		s.Sign(req, nil)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, &HTTPError{resp.StatusCode, fmt.Sprintf("get chunks %.12s/%d/%d-%d from %s: %s", seg, idx, from, to, addr, resp.Status)}
+	}
+	shardHash, err := codec.HexToHash(resp.Header.Get(ShardHashHeader))
+	if err != nil {
+		return 0, err
+	}
+	segProof, err := codec.DecodeProof(resp.Header.Get(ProofHeader))
+	if err != nil || !codec.VerifyShardHash(root, maxN, idx, shardHash, segProof) {
+		return 0, fmt.Errorf("shard %.12s/%d from %s isn't part of the segment", seg, idx, addr)
+	}
+	proofs := strings.Split(resp.Header.Get(ChunkProofHeader), ";")
+	n := 0
+	for c := from; c < to && c < from+len(proofs); c++ {
+		size := min(codec.ChunkSize, shardSize-c*codec.ChunkSize)
+		if size <= 0 {
+			break
+		}
+		data := make([]byte, size)
+		if _, err := io.ReadFull(resp.Body, data); err != nil {
+			return n, err
+		}
+		cp, err := codec.DecodeProof(proofs[c-from])
+		if err != nil || !codec.VerifyChunk(shardHash, shardSize, c, data, cp) {
+			return n, fmt.Errorf("chunk %.12s/%d/%d from %s doesn't verify", seg, idx, c, addr)
+		}
+		got(c, data)
+		n++
+	}
+	return n, nil
+}
 
 // GetChunk fetches chunk c of shard idx and verifies it against the segment
 // root: the shard hash must be in the segment tree and the chunk in the

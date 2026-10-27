@@ -34,8 +34,20 @@ type Client struct {
 	Member     string
 	HTTP       *http.Client
 
-	key *auth.Identity
-	cat *catalog.Catalog
+	// ReadAhead is how many bytes past the segment being read to fetch in
+	// the background; CacheSize bounds the segments kept in memory, shared
+	// by every open file. Set before the first read.
+	ReadAhead int64
+	CacheSize int64
+
+	key   *auth.Identity
+	cat   *catalog.Catalog
+	bg    context.Context
+	stop  context.CancelFunc
+	cache *segCache
+
+	syncMu   sync.Mutex
+	lastSync time.Time
 }
 
 // New opens a client for member, keeping its catalog replica at catalogPath
@@ -50,14 +62,20 @@ func New(coordURL string, poolSecret []byte, member string, key ed25519.PrivateK
 		return nil, err
 	}
 	pool.Attach(cat)
+	bg, stop := context.WithCancel(context.Background())
 	return &Client{
 		CoordURL: coordURL, PoolSecret: poolSecret, Member: member,
-		HTTP: &http.Client{},
-		key:  auth.NewIdentity(key), cat: cat,
+		HTTP:      &http.Client{},
+		ReadAhead: DefaultReadAhead, CacheSize: DefaultCacheSize,
+		key: auth.NewIdentity(key), cat: cat,
+		bg: bg, stop: stop, cache: &segCache{loads: map[string]*segLoad{}},
 	}, nil
 }
 
-func (c *Client) Close() error { return c.cat.Close() }
+func (c *Client) Close() error {
+	c.stop()
+	return c.cat.Close()
+}
 
 // PoolConfig returns the parameters the pool was created with, from the
 // signed catalog. Every member cuts files with the same segment size, which
@@ -78,7 +96,31 @@ func (c *Client) PoolConfig(ctx context.Context) (catalog.PoolConfig, error) {
 // Sync pulls new catalog entries from the coordinator.
 func (c *Client) Sync(ctx context.Context) error {
 	_, err := c.cat.Sync(ctx, c.HTTP, c.CoordURL, c.key.Signer())
+	if err == nil {
+		c.syncMu.Lock()
+		c.lastSync = time.Now()
+		c.syncMu.Unlock()
+	}
 	return err
+}
+
+func (c *Client) staleCatalog() {
+	c.syncMu.Lock()
+	c.lastSync = time.Time{}
+	c.syncMu.Unlock()
+}
+
+// syncRecent syncs unless the catalog was synced within the last second,
+// so a burst of opens (a media server probing, rclone opening a handle per
+// range read) doesn't cost a coordinator round trip each.
+func (c *Client) syncRecent(ctx context.Context) error {
+	c.syncMu.Lock()
+	fresh := time.Since(c.lastSync) < time.Second
+	c.syncMu.Unlock()
+	if fresh {
+		return nil
+	}
+	return c.Sync(ctx)
 }
 
 // Manifest describes one file. It is sealed with the pool secret before it
@@ -250,6 +292,7 @@ func (c *Client) putManifest(ctx context.Context, m Manifest) error {
 		}
 	}
 	fp.Sig = c.key.SignRaw(fp.Message())
+	defer c.staleCatalog() // so our next read sees our own write
 	return transfer.PostJSON(ctx, c.HTTP, c.key, c.CoordURL+"/v1/files", fp, nil)
 }
 
@@ -266,6 +309,7 @@ func (c *Client) Remove(ctx context.Context, poolPath string) error {
 	}
 	fd := catalog.FileDel{PathID: id, Author: c.Member, Replaces: cur.Seq}
 	fd.Sig = c.key.SignRaw(fd.Message())
+	defer c.staleCatalog() // so our next read sees our own write
 	return transfer.PostJSON(ctx, c.HTTP, c.key, c.CoordURL+"/v1/files/delete", fd, nil)
 }
 
@@ -282,9 +326,10 @@ func (c *Client) open(f catalog.File) (Manifest, bool) {
 	return m, true
 }
 
-// List syncs the catalog and returns every readable file, sorted by path.
+// List returns every readable file, sorted by path, from a catalog synced
+// within the last second.
 func (c *Client) List(ctx context.Context) ([]Manifest, error) {
-	if err := c.Sync(ctx); err != nil {
+	if err := c.syncRecent(ctx); err != nil {
 		return nil, err
 	}
 	var out []Manifest
@@ -297,16 +342,27 @@ func (c *Client) List(ctx context.Context) ([]Manifest, error) {
 	return out, nil
 }
 
-// Stat looks a path up in the local replica, syncing first.
+// Stat looks a path up in the local replica, synced within the last
+// second; a path not found there triggers a full sync, in case it's new.
 func (c *Client) Stat(ctx context.Context, poolPath string) (Manifest, error) {
+	p := cleanPath(poolPath)
+	look := func() (Manifest, bool) {
+		if f, ok := c.cat.File(c.pathID(p)); ok {
+			return c.open(f)
+		}
+		return Manifest{}, false
+	}
+	if err := c.syncRecent(ctx); err != nil {
+		return Manifest{}, err
+	}
+	if m, ok := look(); ok {
+		return m, nil
+	}
 	if err := c.Sync(ctx); err != nil {
 		return Manifest{}, err
 	}
-	p := cleanPath(poolPath)
-	if f, ok := c.cat.File(c.pathID(p)); ok {
-		if m, ok := c.open(f); ok {
-			return m, nil
-		}
+	if m, ok := look(); ok {
+		return m, nil
 	}
 	return Manifest{}, fmt.Errorf("%s: %w", p, os.ErrNotExist)
 }

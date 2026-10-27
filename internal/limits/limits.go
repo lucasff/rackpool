@@ -19,6 +19,9 @@ type Bytes int64
 
 func (b *Bytes) String() string { return FormatBytes(int64(*b)) }
 
+// Type names the value in pflag help.
+func (b *Bytes) Type() string { return "size" }
+
 func (b *Bytes) Set(s string) error {
 	n, err := parseUnits(s, "B")
 	*b = Bytes(n)
@@ -36,6 +39,9 @@ func (r *Rate) String() string {
 	}
 	return FormatBytes(int64(*r)) + "bit/s"
 }
+
+// Type names the value in pflag help.
+func (r *Rate) Type() string { return "rate" }
 
 func (r *Rate) Set(s string) error {
 	s = strings.TrimSpace(s)
