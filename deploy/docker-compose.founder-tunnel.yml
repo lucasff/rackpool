@@ -68,7 +68,7 @@ services:
       MP_RC_PASS: ${RC_PASS}
 
   cloudflared:
-    image: cloudflare/cloudflared:2026.9.2
+    image: cloudflare/cloudflared:2026.10.3
     restart: unless-stopped
     depends_on: [coord]
     command: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:2000", "run"]
