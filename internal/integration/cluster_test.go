@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -105,7 +106,9 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 	cfg.RepairSlack, cfg.ShrinkSlack = 1, 1
 	cfg.HotReadsPerShard = 1e9 // no heat unless a test asks for it
 	cfg.HeatTau = 2 * time.Second
-	cfg.OfflineAfter, cfg.DownAfter = 400*time.Millisecond, 1200*time.Millisecond
+	// Heartbeats are driven by hand, so these must leave room for a round
+	// of them plus a tick on a slow, -race CI runner.
+	cfg.OfflineAfter, cfg.DownAfter = time.Second, 3*time.Second
 	cfg.TaskTimeout = 5 * time.Second
 	cfg.SwarmCheckEvery = 300 * time.Millisecond
 	cfg.ProofsPerTick = 50
@@ -189,12 +192,16 @@ func (d *deferredHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.h.ServeHTTP(w, r)
 }
 
+// heartbeat beats every unpaused node at once, so no node's last beat is a
+// whole sequential round older than the others'.
 func (c *cluster) heartbeat() {
+	var wg sync.WaitGroup
 	for _, n := range c.nodes {
 		if !c.paused[n] {
-			_ = n.HeartbeatOnce(c.ctx)
+			wg.Go(func() { _ = n.HeartbeatOnce(c.ctx) })
 		}
 	}
+	wg.Wait()
 }
 
 func (c *cluster) cycle(times int) {
