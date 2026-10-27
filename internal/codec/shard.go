@@ -17,9 +17,53 @@ import (
 // 10 Mbit/s home uplink a 256 KiB chunk arrives in about 0.2 s.
 const ChunkSize = 256 << 10
 
-// ShardSize is the length of every shard of a segment, as the erasure coder
-// splits it.
-func ShardSize(p Params, cipherSize int) int { return (cipherSize + p.K - 1) / p.K }
+// ShardSize is the length of every shard of a segment.
+func ShardSize(p Params, cipherSize int) int { return NewLayout(p.K, cipherSize).ShardSize() }
+
+// Layout maps a segment's ciphertext onto its K data shards, striped like
+// RAID-0: ciphertext chunk n goes to data shard n mod K, as that shard's
+// chunk n/K. Any contiguous range is then spread across holders, so a seek
+// or a player filling its buffer reads from several nodes at once instead
+// of one. Every shard chunk is one contiguous ciphertext range, which is
+// what lets a reader verify and decrypt chunks on their own.
+//
+// The last, partial stripe is split evenly (Tail bytes per shard) rather
+// than padded to a whole stripe, so a segment wastes at most K-1 bytes.
+type Layout struct {
+	K, Len int
+	Full   int // complete stripes of K*ChunkSize bytes
+	Tail   int // bytes per shard in the final partial stripe
+}
+
+func NewLayout(k, ctLen int) Layout {
+	full := ctLen / (k * ChunkSize)
+	rest := ctLen - full*k*ChunkSize
+	return Layout{K: k, Len: ctLen, Full: full, Tail: (rest + k - 1) / k}
+}
+
+func (l Layout) ShardSize() int { return max(1, l.Full*ChunkSize+l.Tail) }
+
+// Chunks is the number of chunks per data shard.
+func (l Layout) Chunks() int { return NumChunks(l.ShardSize()) }
+
+// Span is the ciphertext range [start, end) held by chunk cc of data shard
+// d. It may run past Len (padding), which callers clip.
+func (l Layout) Span(d, cc int) (start, end int) {
+	if cc < l.Full {
+		start = cc*l.K*ChunkSize + d*ChunkSize
+		return start, start + ChunkSize
+	}
+	start = l.Full*l.K*ChunkSize + d*l.Tail
+	return start, start + l.Tail
+}
+
+// Locate returns the data shard and chunk holding ciphertext offset x.
+func (l Layout) Locate(x int) (d, cc int) {
+	if x < l.Full*l.K*ChunkSize {
+		return (x / ChunkSize) % l.K, x / (l.K * ChunkSize)
+	}
+	return min((x-l.Full*l.K*ChunkSize)/max(l.Tail, 1), l.K-1), l.Full
+}
 
 func NumChunks(shardSize int) int { return max(1, (shardSize+ChunkSize-1)/ChunkSize) }
 

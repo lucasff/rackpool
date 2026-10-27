@@ -63,13 +63,26 @@ func New(coordURL string, poolSecret []byte, member string, key ed25519.PrivateK
 	}
 	pool.Attach(cat)
 	bg, stop := context.WithCancel(context.Background())
-	return &Client{
+	c := &Client{
 		CoordURL: coordURL, PoolSecret: poolSecret, Member: member,
 		HTTP:      &http.Client{},
 		ReadAhead: DefaultReadAhead, CacheSize: DefaultCacheSize,
 		key: auth.NewIdentity(key), cat: cat,
 		bg: bg, stop: stop, cache: &segCache{loads: map[string]*segLoad{}},
-	}, nil
+	}
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-bg.Done():
+				return
+			case <-t.C:
+				c.reapIdle()
+			}
+		}
+	}()
+	return c, nil
 }
 
 func (c *Client) Close() error {
@@ -388,6 +401,12 @@ func (c *Client) locate(ctx context.Context, id string) (located, error) {
 	}
 	// Verify against the root in our own replica, not the coordinator's word.
 	s, ok := c.cat.Segment(id)
+	if !ok {
+		if err := c.Sync(ctx); err != nil { // a segment newer than our replica
+			return l, err
+		}
+		s, ok = c.cat.Segment(id)
+	}
 	if !ok || s.ShardRoot != l.loc.Root {
 		return l, fmt.Errorf("segment %.12s: coordinator root disagrees with the catalog", id)
 	}

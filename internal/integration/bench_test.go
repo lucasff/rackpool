@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"mediapool/internal/client"
 	"mediapool/internal/codec"
 	"mediapool/internal/coord"
 	"mediapool/internal/node"
@@ -179,35 +180,54 @@ func benchCluster(t *testing.T, data []byte, seg int, path string) []benchResult
 		r := benchResult{name: fmt.Sprintf("%dMi %s %s", seg>>20, path, cond)}
 		var tt, sk, old []time.Duration
 		buf := make([]byte, 64<<10)
+		// A fresh client for every measurement: the shared segment cache
+		// would otherwise serve repeats from memory.
+		// Each is closed after use so its read-ahead stops competing.
+		var open []*client.Client
+		fresh := func() *client.Client {
+			cl := c.newClient("alice")
+			open = append(open, cl)
+			return cl
+		}
+		closeAll := func() {
+			for _, cl := range open {
+				cl.Close()
+			}
+			open = nil
+			time.Sleep(500 * time.Millisecond) // let holders' rate limits recover
+		}
 		for i := range 3 {
-			f := c.client.Open(c.ctx, m)
+			f := fresh().Open(c.ctx, m)
 			start := time.Now()
 			if _, err := f.ReadAt(buf, 0); err != nil {
 				t.Fatal(err)
 			}
 			tt = append(tt, time.Since(start))
 			f.Close()
+			closeAll()
 
-			f = c.client.Open(c.ctx, m)
+			f = fresh().Open(c.ctx, m)
 			off := int64(len(data))*3/4 + int64(i)*12345
 			start = time.Now()
 			if _, err := f.ReadAt(buf, off); err != nil {
 				t.Fatal(err)
 			}
 			sk = append(sk, time.Since(start))
+			closeAll()
 			if !bytes.Equal(buf, data[off:off+int64(len(buf))]) {
 				t.Fatal("seek read wrong bytes")
 			}
 			f.Close()
 
 			start = time.Now()
-			if _, err := c.client.ReadSegment(c.ctx, m.Segments[0]); err != nil {
+			if _, err := fresh().ReadSegment(c.ctx, m.Segments[0]); err != nil {
 				t.Fatal(err)
 			}
 			old = append(old, time.Since(start))
+			closeAll()
 		}
 		r.ttfb, r.seek, r.oldTTFB = median(tt), median(sk), median(old)
-		f := c.client.Open(c.ctx, m)
+		f := fresh().Open(c.ctx, m)
 		start := time.Now()
 		n, err := io.Copy(io.Discard, f)
 		if err != nil || n != int64(len(data)) {

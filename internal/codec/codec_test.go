@@ -78,3 +78,45 @@ func TestDecryptRangeMatchesGCM(t *testing.T) {
 		}
 	}
 }
+
+func TestStripedLayoutRoundTrips(t *testing.T) {
+	for _, k := range []int{1, 4, 10} {
+		for _, n := range []int{1, 7, ChunkSize - 1, ChunkSize * k, ChunkSize*k + 5, 3*ChunkSize*k + ChunkSize/2 + 11} {
+			p := Params{K: k, MaxN: k + 3}
+			ct := make([]byte, n)
+			for i := range ct {
+				ct[i] = byte(i*31 + i>>9)
+			}
+			lay := NewLayout(k, n)
+			seen := make([]int, n)
+			for d := range k {
+				for cc := range lay.Chunks() {
+					s, e := lay.Span(d, cc)
+					for x := s; x < min(e, n); x++ {
+						seen[x]++
+						if gd, gc := lay.Locate(x); gd != d || gc != cc {
+							t.Fatalf("k=%d n=%d: Locate(%d)=(%d,%d), want (%d,%d)", k, n, x, gd, gc, d, cc)
+						}
+					}
+				}
+			}
+			for x, c := range seen {
+				if c != 1 {
+					t.Fatalf("k=%d n=%d: byte %d covered %d times", k, n, x, c)
+				}
+			}
+			shards, err := Encode(p, ct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			shards[0], shards[k-1] = nil, nil // lose data shards
+			if k == 1 {
+				shards[k-1] = nil
+			}
+			got, err := Join(p, shards, n)
+			if err != nil || !bytes.Equal(got, ct) {
+				t.Fatalf("k=%d n=%d: join failed: %v", k, n, err)
+			}
+		}
+	}
+}

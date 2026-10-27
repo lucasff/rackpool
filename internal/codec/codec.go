@@ -7,7 +7,6 @@
 package codec
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
@@ -122,16 +121,26 @@ func OpenBlob(poolSecret []byte, purpose string, blob []byte) ([]byte, error) {
 	return aead.Open(nil, blob[:n], blob[n:], []byte(purpose))
 }
 
-// Encode splits ciphertext into p.MaxN shards: K data shards plus MaxN-K parity.
+// Encode splits ciphertext into p.MaxN shards: K data shards laid out as
+// described by Layout, plus MaxN-K parity.
 func Encode(p Params, ct []byte) ([][]byte, error) {
 	enc, err := reedsolomon.New(p.K, p.MaxN-p.K)
 	if err != nil {
 		return nil, err
 	}
-	// Split may reuse spare capacity of its input, so hand it a private copy.
-	shards, err := enc.Split(bytes.Clone(ct))
-	if err != nil {
-		return nil, err
+	lay := NewLayout(p.K, len(ct))
+	size := lay.ShardSize()
+	shards := make([][]byte, p.MaxN)
+	for i := range shards {
+		shards[i] = make([]byte, size)
+	}
+	for d := range p.K {
+		for cc := range lay.Chunks() {
+			start, end := lay.Span(d, cc)
+			if start < len(ct) {
+				copy(shards[d][cc*ChunkSize:], ct[start:min(end, len(ct))])
+			}
+		}
 	}
 	if err := enc.Encode(shards); err != nil {
 		return nil, err
@@ -148,7 +157,8 @@ func Reconstruct(p Params, shards [][]byte) error {
 	return enc.Reconstruct(shards)
 }
 
-// Join reassembles the ciphertext of the given size from a full shard set.
+// Join reassembles the ciphertext of the given size from shards (any K
+// present; missing data shards are rebuilt first).
 func Join(p Params, shards [][]byte, size int) ([]byte, error) {
 	enc, err := reedsolomon.New(p.K, p.MaxN-p.K)
 	if err != nil {
@@ -157,11 +167,17 @@ func Join(p Params, shards [][]byte, size int) ([]byte, error) {
 	if err := enc.ReconstructData(shards); err != nil {
 		return nil, err
 	}
-	var buf bytes.Buffer
-	if err := enc.Join(&buf, shards, size); err != nil {
-		return nil, err
+	lay := NewLayout(p.K, size)
+	ct := make([]byte, size)
+	for d := range p.K {
+		for cc := range lay.Chunks() {
+			start, end := lay.Span(d, cc)
+			if start < size {
+				copy(ct[start:min(end, size)], shards[d][cc*ChunkSize:])
+			}
+		}
 	}
-	return buf.Bytes(), nil
+	return ct, nil
 }
 
 // DecryptRange decrypts ct, which starts at byte offset off of a segment's

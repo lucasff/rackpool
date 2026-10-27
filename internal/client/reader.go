@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mediapool/internal/codec"
@@ -37,9 +38,15 @@ import (
 const (
 	DefaultReadAhead = 32 << 20
 	DefaultCacheSize = 256 << 20
+	// idleTimeout cancels a segment still loading that nobody has read
+	// from, waited on or kept in a read-ahead window for this long: the
+	// reader that started it went away (as rclone's downloaders do).
+	idleTimeout = 5 * time.Second
 )
 
 type segCache struct {
+	waiting atomic.Int32 // readers blocked on any segment right now
+
 	mu    sync.Mutex
 	loads map[string]*segLoad
 	bytes int64
@@ -53,6 +60,7 @@ type segLoad struct {
 	err       error
 	firstDone chan struct{} // closed once the first requested chunk is in
 	l         located
+	lay       codec.Layout
 	shardSize int
 	perShard  int // chunks per shard
 	plain     []byte
@@ -63,7 +71,8 @@ type segLoad struct {
 	remaining int
 	failed    error // set if the segment couldn't be read at all
 	once      sync.Once
-	lastUsed  time.Time // guarded by segCache.mu
+	lastUsed  time.Time    // guarded by segCache.mu
+	waiters   atomic.Int32 // readers blocked on this segment right now
 }
 
 // segment returns the shared load for e, starting it (fetching the chunk
@@ -85,6 +94,33 @@ func (c *Client) segment(e SegmentEntry, o int64) *segLoad {
 	sc.mu.Unlock()
 	go l.prioritize(c, o)
 	return l
+}
+
+// reapIdle cancels loads nobody wants any more. Called periodically.
+func (c *Client) reapIdle() {
+	sc := c.cache
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	for id, l := range sc.loads {
+		if !l.done() && l.waiters.Load() == 0 && time.Since(l.lastUsed) > idleTimeout {
+			l.cancel()
+			delete(sc.loads, id)
+			sc.bytes -= l.entry.PlainSize
+		}
+	}
+}
+
+// touch marks the cached segments with these IDs as still wanted.
+func (c *Client) touch(ids []string) {
+	sc := c.cache
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	now := time.Now()
+	for _, id := range ids {
+		if l := sc.loads[id]; l != nil {
+			l.lastUsed = now
+		}
+	}
 }
 
 // evictLocked drops finished segments, least recently used first, until
@@ -152,8 +188,9 @@ func (l *segLoad) run(ctx context.Context, c *Client, first int64) {
 	}
 	p := loc.loc.Params
 	l.l = loc
-	l.shardSize = codec.ShardSize(p, loc.seg.CipherSize)
-	l.perShard = codec.NumChunks(l.shardSize)
+	l.lay = codec.NewLayout(p.K, loc.seg.CipherSize)
+	l.shardSize = l.lay.ShardSize()
+	l.perShard = l.lay.Chunks()
 	l.plain = make([]byte, l.entry.PlainSize)
 	total := p.K * l.perShard
 	l.ready, l.closed = make([]chan struct{}, total), make([]bool, total)
@@ -177,13 +214,16 @@ func (l *segLoad) run(ctx context.Context, c *Client, first int64) {
 	}
 	close(l.firstDone)
 
-	// Then every data shard streams the rest of its chunks, all at once.
+	// Then every data shard streams the rest of its chunks, all at once,
+	// starting at the reader's stripe and wrapping around to the earlier
+	// ones, so what's read next arrives first.
+	c0 := g0 % l.perShard
 	var wg sync.WaitGroup
 	for d := range p.K {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if !l.fetchShard(ctx, c, d) && ctx.Err() == nil {
+			if !l.fetchShard(ctx, c, d, c0) && ctx.Err() == nil {
 				l.fallback(ctx, c)
 			}
 		}()
@@ -202,39 +242,60 @@ func (l *segLoad) holders(d int) []proto.Location {
 	return hs
 }
 
-// fetchShard gets every chunk of data shard d not yet present, streaming
-// runs from its holders and filling gaps one chunk at a time.
-func (l *segLoad) fetchShard(ctx context.Context, c *Client, d int) bool {
+// fetchShard gets every chunk of data shard d not yet present: chunks
+// [c0, end) first, then [0, c0), streaming runs from its holders and
+// filling gaps one chunk at a time.
+func (l *segLoad) fetchShard(ctx context.Context, c *Client, d, c0 int) bool {
+	if c0 > 0 && !l.fetchRange(ctx, c, d, c0, l.perShard) {
+		return false
+	}
+	return l.fetchRange(ctx, c, d, 0, l.perShard)
+}
+
+// fetchRange gets the missing chunks in [lo, hi) of data shard d.
+func (l *segLoad) fetchRange(ctx context.Context, c *Client, d, lo, hi int) bool {
 	next := func(from int) int {
-		for cc := from; cc < l.perShard; cc++ {
+		for cc := from; cc < hi; cc++ {
 			if !l.isReady(d*l.perShard + cc) {
 				return cc
 			}
 		}
-		return l.perShard
+		return hi
 	}
-	from := next(0)
+	from := next(lo)
 	for _, h := range l.holders(d) {
-		for from < l.perShard && ctx.Err() == nil {
-			to := min(from+transfer.MaxChunkRun, l.perShard)
+		for from < hi && ctx.Err() == nil {
+			to := min(from+transfer.MaxChunkRun, hi)
 			_, err := transfer.GetChunks(ctx, c.HTTP, c.key, h.Addr, l.entry.ID, d, l.l.root, l.l.loc.Params.MaxN, l.shardSize, from, to,
+				func() { l.yield(ctx, c) },
 				func(cc int, data []byte) { l.publish(d*l.perShard+cc, data) })
 			from = next(from)
 			if err != nil {
 				break // try the next holder for what's left
 			}
 		}
-		if from >= l.perShard {
+		if from >= hi {
 			return true
 		}
 	}
 	// Last resort per chunk, then the caller falls back to parity.
-	for cc := from; cc < l.perShard; cc++ {
+	for cc := from; cc < hi; cc++ {
 		if g := d*l.perShard + cc; !l.isReady(g) && !l.fetch(ctx, c, g) {
 			return false
 		}
 	}
 	return true
+}
+
+// yield pauses this segment's background streaming while a reader waits on
+// some other segment, so holders' upload goes to what's needed now: a
+// player seeking to an MKV's index at the end isn't stuck behind
+// read-ahead. Blocking here stops reading the response, and TCP
+// backpressure stops the holder sending.
+func (l *segLoad) yield(ctx context.Context, c *Client) {
+	for c.cache.waiting.Load() > 0 && l.waiters.Load() == 0 && ctx.Err() == nil {
+		time.Sleep(2 * time.Millisecond)
+	}
 }
 
 // fetch gets one chunk from any holder of its shard.
@@ -282,17 +343,16 @@ func (l *segLoad) prioritize(c *Client, o int64) {
 	l.fetch(ctx, c, g) // run's shard streams or fallback cover a failure
 }
 
-// span returns the plaintext byte range chunk g covers.
+// span returns the plaintext byte range chunk g covers (chunk g is chunk
+// g%perShard of data shard g/perShard).
 func (l *segLoad) span(g int) (start, end int) {
-	d, cc := g/l.perShard, g%l.perShard
-	start = d*l.shardSize + cc*codec.ChunkSize
-	end = d*l.shardSize + min((cc+1)*codec.ChunkSize, l.shardSize)
+	start, end = l.lay.Span(g/l.perShard, g%l.perShard)
 	return min(start, len(l.plain)), min(end, len(l.plain))
 }
 
 func (l *segLoad) chunkFor(o int64) int {
-	d := int(o) / l.shardSize
-	return d*l.perShard + (int(o)%l.shardSize)/codec.ChunkSize
+	d, cc := l.lay.Locate(int(o))
+	return d*l.perShard + cc
 }
 
 func (l *segLoad) isReady(g int) bool {
@@ -344,7 +404,7 @@ func (l *segLoad) fallback(ctx context.Context, c *Client) {
 
 // wait blocks until the chunk holding offset o is available and returns
 // where that chunk's plaintext ends.
-func (l *segLoad) wait(ctx context.Context, o int64) (end int, err error) {
+func (l *segLoad) wait(ctx context.Context, c *Client, o int64) (end int, err error) {
 	select {
 	case <-l.setup:
 	case <-ctx.Done():
@@ -354,6 +414,12 @@ func (l *segLoad) wait(ctx context.Context, o int64) (end int, err error) {
 		return 0, l.err
 	}
 	g := l.chunkFor(o)
+	if !l.isReady(g) {
+		l.waiters.Add(1)
+		c.cache.waiting.Add(1)
+		defer l.waiters.Add(-1)
+		defer c.cache.waiting.Add(-1)
+	}
 	select {
 	case <-l.ready[g]:
 	case <-ctx.Done():
@@ -445,6 +511,18 @@ func (f *File) readAhead(i int, l *segLoad) {
 	}()
 }
 
+// window lists the IDs of the segments read-ahead covers after segment i.
+func (f *File) window(i int) []string {
+	var ids []string
+	start := f.segStart(i + 1)
+	limit := start + f.c.ReadAhead
+	for j := i + 1; j < len(f.m.Segments) && start < f.end && start < limit; j++ {
+		ids = append(ids, f.m.Segments[j].ID)
+		start += f.m.Segments[j].PlainSize
+	}
+	return ids
+}
+
 func (f *File) segStart(i int) int64 {
 	var s int64
 	for j := range i {
@@ -463,7 +541,8 @@ func (f *File) ReadAt(p []byte, off int64) (int, error) {
 		o := off - segStart
 		l := f.c.segment(f.m.Segments[i], o)
 		f.readAhead(i, l)
-		end, err := l.wait(f.ctx, o)
+		f.c.touch(f.window(i))
+		end, err := l.wait(f.ctx, f.c, o)
 		if err != nil {
 			if f.ctx.Err() == nil {
 				f.c.forget(l) // retry from scratch on the next read

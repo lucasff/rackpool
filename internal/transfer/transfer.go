@@ -33,7 +33,10 @@ const MaxChunkRun = 64
 // calls got for each as soon as it has arrived and verified, in order. It
 // returns the number of chunks delivered; on error the caller can retry
 // the rest elsewhere.
-func GetChunks(ctx context.Context, hc *http.Client, s Signer, addr, seg string, idx int, root merkle.Hash, maxN, shardSize, from, to int, got func(c int, data []byte)) (int, error) {
+//
+// pace, if non-nil, runs before each chunk is read; blocking in it applies
+// TCP backpressure, freeing the holder's upload for other requests.
+func GetChunks(ctx context.Context, hc *http.Client, s Signer, addr, seg string, idx int, root merkle.Hash, maxN, shardSize, from, to int, pace func(), got func(c int, data []byte)) (int, error) {
 	u := fmt.Sprintf("%s/v1/chunks/%s/%d?root=%s&from=%d&to=%d", addr, seg, idx, codec.HashToHex(root), from, to)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -64,6 +67,9 @@ func GetChunks(ctx context.Context, hc *http.Client, s Signer, addr, seg string,
 		size := min(codec.ChunkSize, shardSize-c*codec.ChunkSize)
 		if size <= 0 {
 			break
+		}
+		if pace != nil {
+			pace()
 		}
 		data := make([]byte, size)
 		if _, err := io.ReadFull(resp.Body, data); err != nil {

@@ -33,12 +33,26 @@ type Pool struct {
 	URL      string // coordinator base URL
 	Dir      string // holds pool.json and <member>.key
 	PoolFile string
+	Nodes    []*node.Node
 }
 
 // Start runs a coordinator and n storage nodes (each run by its own member,
 // so each is its own failure domain) until the test ends. Erasure coding is
 // K=4 with up to 12 shards, so n should be at least 12.
 func Start(t testing.TB, n int) *Pool {
+	t.Helper()
+	return StartWith(t, n, Options{K: 4, MaxN: 12, AnchoredN: 6, OrphanN: 9, SegmentSize: 64 << 10})
+}
+
+// Options sets the pool's erasure code and segment size.
+type Options struct {
+	K, MaxN, AnchoredN, OrphanN int
+	SegmentSize                 int
+}
+
+// StartWith is Start with explicit pool parameters; n must be at least
+// opt.OrphanN.
+func StartWith(t testing.TB, n int, opt Options) *Pool {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -81,15 +95,15 @@ func Start(t testing.TB, n int) *Pool {
 	writeFile(t, p.PoolFile, b)
 
 	cfg := coord.DefaultConfig()
-	cfg.Params = codec.Params{K: 4, MaxN: 12}
-	cfg.SegmentSize = 64 << 10 // small, so tests cross segment boundaries
-	cfg.AnchoredN, cfg.OrphanN = 6, 9
+	cfg.Params = codec.Params{K: opt.K, MaxN: opt.MaxN}
+	cfg.SegmentSize = opt.SegmentSize
+	cfg.AnchoredN, cfg.OrphanN = opt.AnchoredN, opt.OrphanN
 	cfg.TargetLoss = 0
 	cfg.RepairSlack, cfg.ShrinkSlack = 1, 1
 	cfg.HotReadsPerShard = 1e9
 	cfg.TickEvery = 200 * time.Millisecond
 	cfg.GCGrace = time.Hour
-	cfg.Key, cfg.Pool, cfg.Fresh = coordKey, pool, true
+	cfg.Key, cfg.Pool, cfg.Fresh = coordKey, pool.Clone(), true // each process attaches its own catalog
 	cfg.LogPath = filepath.Join(t.TempDir(), "coord.log")
 	co, err := coord.New(cfg)
 	if err != nil {
@@ -106,13 +120,14 @@ func Start(t testing.TB, n int) *Pool {
 	for _, pd := range ps {
 		nd, err := node.New(node.Config{
 			ID: pd.id, Addr: pd.srv.URL, DataDir: t.TempDir(), CoordURL: p.URL,
-			Heartbeat: 500 * time.Millisecond, Key: pd.key, Pool: pool,
+			Heartbeat: 500 * time.Millisecond, Key: pd.key, Pool: pool.Clone(),
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { nd.Close() })
 		pd.h.h = nd.Handler()
+		p.Nodes = append(p.Nodes, nd)
 		if err := nd.HeartbeatOnce(ctx); err != nil {
 			t.Fatal(err)
 		}
