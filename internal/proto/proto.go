@@ -189,6 +189,21 @@ type CommitRequest struct {
 	Placed  []Location `json:"placed"`
 }
 
+// LinkRequest registers a segment that Origin, a node owned by the caller,
+// serves from a local file instead of storing shards in the pool. The
+// coordinator fetches k shards from the origin and verifies them, exactly as
+// it verifies an upload, before the segment enters the catalog.
+type LinkRequest struct {
+	Segment    string `json:"segment"`
+	CipherSize int    `json:"cipher_size"`
+	Root       string `json:"root"`
+	Origin     string `json:"origin"`
+}
+
+type LinkResponse struct {
+	Exists bool `json:"exists"` // already in the pool (stored or linked): nothing registered
+}
+
 type FilePutRequest struct {
 	PathID   string   `json:"path_id"`
 	Segments []string `json:"segments"`

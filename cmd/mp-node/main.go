@@ -61,6 +61,7 @@ func main() {
 	flag.IntVar(&cfg.MaxTransfers, "max-transfers", 16, "concurrent shard transfers")
 	flag.BoolVar(&cfg.Drain, "drain", false, "move all shards to other nodes, then hold nothing (to leave the pool or free the disk)")
 	mirror := flag.String("bridge-mirror", "", "act as a bridge, serving torrent sources from this directory (<dir>/<infohash>/<file>)")
+	flag.StringVar(&cfg.LinkRoot, "link-root", "", "let this node link files under this directory into the pool without uploading them; it serves them itself (needs MEDIAPOOL_SECRET; link with `mp rc node/link`)")
 	rcAddr := flag.String("rc-addr", "", "serve the rc API and web UI here, e.g. 127.0.0.1:5572 (off by default)")
 	rcUser := flag.String("rc-user", "", "rc basic-auth user (required unless -rc-addr is loopback)")
 	rcPass := flag.String("rc-pass", "", "rc basic-auth password")
@@ -128,6 +129,12 @@ func main() {
 	if *mirror != "" {
 		cfg.Source = &bridge.Mirror{Dir: *mirror}
 		cfg.PoolSecret = []byte(os.Getenv("MEDIAPOOL_SECRET"))
+	}
+	if cfg.LinkRoot != "" {
+		cfg.PoolSecret = []byte(os.Getenv("MEDIAPOOL_SECRET"))
+		if len(cfg.PoolSecret) == 0 {
+			log.Fatal("-link-root needs MEDIAPOOL_SECRET to regenerate linked segments")
+		}
 	}
 
 	n, err := node.New(cfg)
