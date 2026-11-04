@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"mediapool/internal/client"
 	"mediapool/internal/limits"
 	"mediapool/internal/node"
 	"mediapool/internal/stats"
@@ -91,6 +92,7 @@ func init() {
 		"pool/status":           {needs: "fs", help: "The coordinator's view: nodes, capacity, segments.", fn: poolStatus},
 		"node/status":           {needs: "node", help: "This node's address, reachability and capacity.", fn: nodeStatus},
 		"node/limits/set":       {needs: "node", help: "Change limits until restart. Params (all optional): quota, upload_limit, download_limit (\"50M\" = 50 Mbit/s), drain (bool).", fn: nodeLimitsSet},
+		"node/link":             {needs: "node", help: "Link a file or directory under the node's link root into the pool without uploading it; this node serves it. Params: src (path under the link root), dst (pool path; default: same as src). Use _async for big trees.", fn: nodeLink},
 	}
 }
 
@@ -509,6 +511,73 @@ func opCopyFile(ctx context.Context, s *Server, in Params) (Params, error) {
 	}
 	local := filepath.Join(dstFs, filepath.FromSlash(dstRemote))
 	return Params{}, s.download(ctx, path.Join(strings.TrimPrefix(srcFs, "pool:"), srcRemote), local)
+}
+
+// nodeLink links src (a file or a directory tree under the node's link root)
+// into the pool at dst. Files are read once to compute segment IDs; nothing
+// is uploaded. macOS metadata files (._*, .DS_Store) are skipped. One file
+// failing doesn't stop the rest; failures are listed in the result.
+func nodeLink(ctx context.Context, s *Server, in Params) (Params, error) {
+	if s.FS == nil {
+		return nil, fmt.Errorf("%w: linking needs member credentials on this node (rc-member)", errBadParam)
+	}
+	root := s.Node.LinkRoot()
+	if root == "" {
+		return nil, fmt.Errorf("%w: this node has no link root (MP_LINK_ROOT)", errBadParam)
+	}
+	src, err := str(in, "src", true)
+	if err != nil {
+		return nil, err
+	}
+	dst, _ := str(in, "dst", false)
+	rel := strings.TrimPrefix(path.Clean("/"+filepath.ToSlash(src)), "/")
+	if dst == "" {
+		dst = "/" + rel
+	}
+	dst = vfs.Clean(dst)
+	base := filepath.Join(root, filepath.FromSlash(rel))
+
+	var tot client.LinkStats
+	files := 0
+	failed := []string{} // [] not null in the JSON result
+	err = filepath.WalkDir(base, func(p string, d os.DirEntry, werr error) error {
+		if werr != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", p, werr))
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		name := d.Name()
+		if d.IsDir() || strings.HasPrefix(name, "._") || name == ".DS_Store" {
+			return nil
+		}
+		sub, err := filepath.Rel(base, p)
+		if err != nil {
+			return err
+		}
+		remote := dst
+		if sub != "." {
+			remote = path.Join(dst, filepath.ToSlash(sub))
+		}
+		st, err := s.FS.C.LinkFile(ctx, s.Node, p, remote)
+		if err != nil {
+			failed = append(failed, fmt.Sprintf("%s: %v", p, err))
+			return nil
+		}
+		files++
+		tot.Segments += st.Segments
+		tot.Linked += st.Linked
+		tot.Deduped += st.Deduped
+		tot.PlainSize += st.PlainSize
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.FS.Invalidate()
+	return Params{"files": files, "segments": tot.Segments, "linked": tot.Linked, "deduped": tot.Deduped,
+		"bytes": tot.PlainSize, "failed": failed}, nil
 }
 
 func (s *Server) upload(ctx context.Context, local, remote string) error {

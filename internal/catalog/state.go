@@ -33,7 +33,15 @@ type SegmentAdd struct {
 	CipherSize int    `json:"cipher_size"`
 	ShardRoot  string `json:"shard_root"`       // Merkle root over the segment's shard hashes
 	Source     []byte `json:"source,omitempty"` // sealed torrent source reference
+	// Origin, when set, names the node that linked this segment from a file
+	// on its own disk. A linked segment has no stored shards: the origin
+	// regenerates them on request, so it's readable only while that node is
+	// online, and the scheduler neither repairs nor shrinks it.
+	Origin string `json:"origin,omitempty"`
 }
+
+// Linked reports whether the segment is served from its origin's own files.
+func (s SegmentAdd) Linked() bool { return s.Origin != "" }
 
 type SegmentSource struct {
 	ID     string `json:"id"`

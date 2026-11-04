@@ -126,6 +126,8 @@ func newCluster(t *testing.T, n int, tune func(*coord.Config)) *cluster {
 		ncfg := node.Config{
 			ID: p.id, Addr: p.srv.URL, DataDir: t.TempDir(), CoordURL: c.url,
 			Key: p.key, Pool: c.pool.Clone(), Logf: t.Logf,
+			// Every node may link files from its own directory (link_test.go).
+			LinkRoot: t.TempDir(), PoolSecret: secret,
 		}
 		if p.id == "bridge" {
 			ncfg.Source, ncfg.PoolSecret = c.mirror, secret

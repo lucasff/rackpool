@@ -70,6 +70,11 @@ type Config struct {
 	PoolSecret []byte
 	Source     bridge.Source
 
+	// LinkRoot is a local directory whose files this node may link into the
+	// pool without uploading them (see link.go). Linking also needs
+	// PoolSecret. Empty turns linking off.
+	LinkRoot string
+
 	HTTP *http.Client
 	Logf func(format string, args ...any)
 }
@@ -96,6 +101,8 @@ type Node struct {
 	upBps       int64 // current caps; the buckets enforce them
 	downBps     int64
 	used        int64 // bytes of shards on disk, kept current on write/delete
+
+	links links // segments served from local files; has its own lock
 }
 
 func New(cfg Config) (*Node, error) {
@@ -142,6 +149,9 @@ func New(cfg Config) (*Node, error) {
 	}
 	if n.used, err = n.diskUsage(); err != nil {
 		return nil, err
+	}
+	if err := n.loadLinks(); err != nil {
+		return nil, fmt.Errorf("node: link index: %w", err)
 	}
 	return n, nil
 }
@@ -319,6 +329,9 @@ func (n *Node) writeShard(k proto.ShardKey, data []byte, proof string) error {
 
 func (n *Node) readShard(k proto.ShardKey) ([]byte, string, error) {
 	data, err := os.ReadFile(n.shardPath(k))
+	if errors.Is(err, os.ErrNotExist) {
+		return n.readLinked(k) // not stored: maybe a linked segment we regenerate
+	}
 	if err != nil {
 		return nil, "", err
 	}
@@ -336,8 +349,17 @@ func (n *Node) removeShard(k proto.ShardKey) {
 	_ = os.Remove(filepath.Dir(p)) // only succeeds once empty
 }
 
-// Inventory lists every shard on disk.
+// Inventory lists every shard on disk, plus the data shards of linked
+// segments, which are regenerated from local files on request.
 func (n *Node) Inventory() ([]proto.ShardKey, error) {
+	inv, err := n.storedInventory()
+	if err != nil {
+		return nil, err
+	}
+	return append(inv, n.linkInventory()...), nil
+}
+
+func (n *Node) storedInventory() ([]proto.ShardKey, error) {
 	var out []proto.ShardKey
 	root := filepath.Join(n.cfg.DataDir, "shards")
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -787,8 +809,14 @@ func (n *Node) applyDeletes(dels []proto.ShardKey, inv []proto.ShardKey) {
 		}
 		seg, known := n.cat.Segment(k.Segment)
 		switch {
-		case known && !seg.Live(), known && seg.ShardRoot != k.Root:
-			n.removeShard(k) // collected, or junk under a committed ID: free
+		case known && !seg.Live():
+			n.removeShard(k) // collected: free
+			n.unlink(k.Segment)
+		case known && seg.ShardRoot != k.Root:
+			n.removeShard(k) // junk under a committed ID: free
+		case known && seg.Linked() && seg.Origin == n.cfg.ID:
+			// Our own linked segment: nothing is stored, and the scheduler
+			// never asks to shrink one. Ignore rather than spend budget.
 		case !known:
 			// Our replica may be behind the coordinator; never delete what we
 			// can't account for.

@@ -308,6 +308,7 @@ func (c *Coordinator) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/probe", c.nodeOnly(c.handleProbe))
 	mux.HandleFunc("POST /v1/prepare", c.memberOnly(c.handlePrepare))
 	mux.HandleFunc("POST /v1/commit", c.memberOnly(c.handleCommit))
+	mux.HandleFunc("POST /v1/link", c.memberOnly(c.handleLink))
 	mux.HandleFunc("POST /v1/files", c.memberOnly(c.handleFilePut))
 	mux.HandleFunc("POST /v1/files/delete", c.memberOnly(c.handleFileDel))
 	mux.HandleFunc("GET /v1/locate/{seg}", c.memberOnly(c.handleLocate))
@@ -392,6 +393,8 @@ func anchored(s catalog.Segment) bool { return s.Source != nil && s.Swarm == cat
 
 func class(s catalog.Segment) string {
 	switch {
+	case s.Linked():
+		return "linked"
 	case anchored(s):
 		return "anchored"
 	case s.Source != nil && s.Swarm == catalog.SwarmUnknown:
@@ -662,6 +665,11 @@ func (c *Coordinator) Tick() {
 }
 
 func (c *Coordinator) schedule(s catalog.Segment, byIdx map[int][]string, now time.Time, hotBudget *int) {
+	if s.Linked() {
+		// Served by its origin from local files: nothing to place, repair,
+		// shrink or move. (Prototype: no replication into the pool yet.)
+		return
+	}
 	si := c.info(s.ID)
 	if si.pending != nil && now.After(si.pending.deadline) {
 		c.cfg.Logf("segment %.12s: task %s timed out", s.ID, si.pending.taskID)
@@ -1067,7 +1075,10 @@ func (c *Coordinator) pickChallenges(now time.Time) []challenge {
 		}
 		for k, st := range n.shards {
 			s, ok := c.cat.Segment(k.Segment)
-			if !ok || !s.Live() || s.ShardRoot != k.Root {
+			if !ok || !s.Live() || s.ShardRoot != k.Root || s.Linked() {
+				// Linked segments were verified at link time and earn no
+				// storage credit; challenging them would only make the
+				// origin re-read its files.
 				continue
 			}
 			size := codec.ShardSize(c.cfg.Params, s.CipherSize)
@@ -1187,6 +1198,12 @@ func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, _ *http.Request, p 
 		s, known := c.cat.Segment(k.Segment)
 		switch {
 		case !known:
+		case s.Live() && s.ShardRoot == k.Root && s.Linked():
+			// Only the origin can serve a linked segment, and only its data
+			// shards. It proved it can at link time.
+			if s.Origin == n.entry.ID && k.Index < c.cfg.Params.K {
+				n.shards[k] = credited
+			}
 		case s.Live() && s.ShardRoot == k.Root:
 			n.shards[k] = unverified
 		default:
@@ -1457,6 +1474,72 @@ func (c *Coordinator) handleCommit(w http.ResponseWriter, r *http.Request, _ aut
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleLink admits a linked segment: one the caller's own node serves from a
+// local file, with no shards stored in the pool. The coordinator rebuilds it
+// from k shards fetched from that node, as for an upload, so a member can't
+// link junk under the ID of a popular file. If the segment is already in the
+// pool, stored or linked, nothing changes and the caller just references it.
+func (c *Coordinator) handleLink(w http.ResponseWriter, r *http.Request, p auth.Principal, body []byte) {
+	var req proto.LinkRequest
+	if err := json.Unmarshal(body, &req); err != nil || req.CipherSize <= 0 || len(req.Segment) != 64 || req.Origin == "" {
+		http.Error(w, "bad link request", http.StatusBadRequest)
+		return
+	}
+	if _, err := codec.HexToHash(req.Root); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	c.mu.Lock()
+	if !c.writable(w) {
+		c.mu.Unlock()
+		return
+	}
+	if s, ok := c.cat.Segment(req.Segment); ok && s.Live() {
+		c.mu.Unlock()
+		writeJSON(w, proto.LinkResponse{Exists: true})
+		return
+	}
+	now := time.Now()
+	n := c.nodes[req.Origin]
+	switch {
+	case n == nil || !c.online(n, now):
+		c.mu.Unlock()
+		http.Error(w, "origin node "+req.Origin+" isn't online", http.StatusServiceUnavailable)
+		return
+	case n.entry.Owner != p.Member:
+		c.mu.Unlock()
+		http.Error(w, "members can only link from their own nodes", http.StatusForbidden)
+		return
+	}
+	add := catalog.SegmentAdd{ID: req.Segment, CipherSize: req.CipherSize, ShardRoot: req.Root, Origin: req.Origin}
+	placed := make([]proto.Location, c.cfg.Params.K)
+	for i := range placed {
+		placed[i] = location(n, i)
+	}
+	c.mu.Unlock()
+
+	if err := c.verifyUpload(r.Context(), add, placed); err != nil {
+		http.Error(w, "link rejected: "+err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if s, ok := c.cat.Segment(add.ID); ok && s.Live() {
+		writeJSON(w, proto.LinkResponse{Exists: true}) // a concurrent add won
+		return
+	}
+	if _, err := c.appendEntry(catalog.TypeSegmentAdd, add); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, l := range placed {
+		n.hold(proto.ShardKey{Segment: add.ID, Index: l.Index, Root: add.ShardRoot}, credited)
+	}
+	c.cfg.Logf("segment %.12s: linked from %s", add.ID, add.Origin)
+	writeJSON(w, proto.LinkResponse{})
+}
+
 func (c *Coordinator) verifyUpload(ctx context.Context, add catalog.SegmentAdd, placed []proto.Location) error {
 	root, err := codec.HexToHash(add.ShardRoot)
 	if err != nil {
@@ -1581,6 +1664,13 @@ func (c *Coordinator) Status() proto.StatusResponse {
 		st.LossProb = c.lossOf(holders)
 		if c.cfg.TargetLoss > 0 {
 			st.Target = 0 // no fixed target: sized by loss
+		}
+		if s.Linked() {
+			// One failure domain: the origin. Its k shards are one copy.
+			st.Target, st.LossProb = c.cfg.Params.K, 1
+			if o := c.nodes[s.Origin]; o != nil {
+				st.LossProb = c.failProb(o)
+			}
 		}
 		out.Segments = append(out.Segments, st)
 	}
